@@ -1,0 +1,22 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "cf-chat-widget",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // ADR-008: the widget reaches the Conversation agent through a service
+  // binding to `app`, not a cross-script Durable Object binding. The DO
+  // namespace stays private to `app`.
+  "services": [
+    {
+      "binding": "APP",
+      "service": "cf-chat-app"
+    }
+  ],
+
+  "observability": {
+    "traces": { "enabled": true },
+    "logs": { "enabled": true }
+  }
+}

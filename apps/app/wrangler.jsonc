@@ -1,0 +1,37 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "cf-chat-app",
+  "main": "@tanstack/react-start/server-entry",
+  "compatibility_date": "2026-08-22",
+  // nodejs_compat is required by the `pg` driver used to reach Neon via Hyperdrive.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      // Replace with the id from `wrangler kv namespace create KV`.
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+    }
+  ],
+
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      // Replace with the id from `wrangler hyperdrive create cf-chat-neon --connection-string=...`.
+      "id": "REPLACE_WITH_HYPERDRIVE_ID"
+      // Local dev reads CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE
+      // from the environment rather than a connection string committed here.
+    }
+  ],
+
+  // ADR-007. `destinations` is deliberately absent until the OTLP destination
+  // open item in docs/plan.md is settled; traces still land in the dashboard.
+  "observability": {
+    "traces": {
+      "enabled": true
+    },
+    "logs": {
+      "enabled": true
+    }
+  }
+}

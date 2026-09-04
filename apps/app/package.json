@@ -1,0 +1,36 @@
+{
+  "name": "@cf-chat/app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --port 3000",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsr generate && tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "deploy": "vite build && wrangler deploy",
+    "generate-routes": "tsr generate"
+  },
+  "dependencies": {
+    "@cf-chat/db": "workspace:*",
+    "@cf-chat/reply-loop": "workspace:*",
+    "@cf-chat/retrieval": "workspace:*",
+    "@cf-chat/shared": "workspace:*",
+    "@tanstack/react-router": "1.170.32",
+    "@tanstack/react-start": "1.168.49",
+    "hono": "4.13.5",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.54.3",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.1.1",
+    "vite": "8.2.2",
+    "wrangler": "4.128.0",
+    "@tanstack/router-cli": "1.167.33"
+  }
+}

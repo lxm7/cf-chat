@@ -1,0 +1,19 @@
+{
+  "name": "@cf-chat/widget",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cf-chat/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "wrangler": "4.128.0"
+  }
+}
