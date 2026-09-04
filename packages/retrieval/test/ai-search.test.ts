@@ -13,6 +13,8 @@ interface FakeOptions {
   readonly item?: unknown;
   readonly createThrows?: boolean;
   readonly uploadThrows?: Error;
+  readonly info?: unknown;
+  readonly infoThrows?: Error;
 }
 
 /** Records what the binding was asked to do, so the calls can be asserted on. */
@@ -20,6 +22,7 @@ function fakeNamespace(options: FakeOptions = {}) {
   const created: string[] = [];
   const gotten: string[] = [];
   const uploads: Array<{ name: string; instance: string }> = [];
+  const inspected: Array<{ itemId: string; instance: string }> = [];
   const deleted: string[] = [];
 
   const instance = (id: string): AiSearchInstanceLike => ({
@@ -28,6 +31,22 @@ function fakeNamespace(options: FakeOptions = {}) {
         if (options.uploadThrows) throw options.uploadThrows;
         uploads.push({ name, instance: id });
         return options.item ?? { id: "item-1", key: name, status: "completed", chunks_count: 3 };
+      },
+      get: (itemId) => {
+        inspected.push({ itemId, instance: id });
+        return {
+          info: async () => {
+            if (options.infoThrows) throw options.infoThrows;
+            return (
+              options.info ?? {
+                id: itemId,
+                key: "faq.md",
+                status: "completed",
+                chunks_count: 3,
+              }
+            );
+          },
+        };
       },
       delete: async (itemId) => {
         deleted.push(itemId);
@@ -47,7 +66,7 @@ function fakeNamespace(options: FakeOptions = {}) {
     },
   };
 
-  return { namespace, created, gotten, uploads, deleted };
+  return { namespace, created, gotten, uploads, inspected, deleted };
 }
 
 describe("instanceId", () => {
@@ -155,6 +174,63 @@ describe("AISearchIndexer", () => {
     });
 
     expect(result).toMatchObject({ ok: true, value: { status: "queued", chunkCount: null } });
+  });
+
+  it("reports an item that has finished indexing since the upload gave up", async () => {
+    const fake = fakeNamespace({
+      info: { id: "item-9", key: "faq.md", status: "completed", chunks_count: 7 },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).status(tenantId, "item-9");
+
+    expect(result).toEqual({
+      ok: true,
+      value: { itemId: "item-9", key: "faq.md", status: "completed", chunkCount: 7 },
+    });
+    // Through get, not create: a status read has no business provisioning.
+    expect(fake.created).toEqual([]);
+    expect(fake.inspected).toEqual([{ itemId: "item-9", instance: instanceId(tenantId) }]);
+  });
+
+  it("reports an item that is still indexing as unfinished rather than failed", async () => {
+    const fake = fakeNamespace({
+      info: { id: "item-9", key: "faq.md", status: "running", chunks_count: null },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).status(tenantId, "item-9");
+
+    expect(result).toMatchObject({ ok: true, value: { status: "running", chunkCount: null } });
+  });
+
+  it("turns an item that failed indexing into a rejection", async () => {
+    const fake = fakeNamespace({
+      info: { id: "item-9", key: "faq.md", status: "error", error: "unsupported content type" },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).status(tenantId, "item-9");
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { kind: "rejected", reason: "unsupported_type" },
+    });
+  });
+
+  it("treats a vanished item as terminal, so a check cannot wait on it forever", async () => {
+    const notFound = new Error("item_not_found");
+    notFound.name = "AiSearchNotFoundError";
+    const fake = fakeNamespace({ infoThrows: notFound });
+
+    const result = await new AISearchIndexer(fake.namespace).status(tenantId, "item-9");
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "rejected", reason: "not_found" } });
+  });
+
+  it("treats any other thrown error on a status read as an outage", async () => {
+    const fake = fakeNamespace({ infoThrows: new Error("connection reset") });
+
+    const result = await new AISearchIndexer(fake.namespace).status(tenantId, "item-9");
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "unavailable" } });
   });
 
   it("deletes through the tenant's own instance", async () => {

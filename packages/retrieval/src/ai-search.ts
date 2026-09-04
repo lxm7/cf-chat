@@ -7,6 +7,10 @@ import type { IndexableDocument, IndexError, IndexedItem, Indexer } from "./type
  * call. Declared here rather than leaning on the ambient Workers global so this
  * package stays free of a workers-types dependency and stays trivially fakeable.
  */
+export interface AiSearchItem {
+  info(): Promise<unknown>;
+}
+
 export interface AiSearchItems {
   uploadAndPoll(
     name: string,
@@ -17,6 +21,7 @@ export interface AiSearchItems {
       timeoutMs?: number;
     },
   ): Promise<unknown>;
+  get(itemId: string): AiSearchItem;
   delete(itemId: string): Promise<unknown>;
 }
 
@@ -60,8 +65,17 @@ const itemInfo = z.object({
 });
 
 /** Map AI Search's own error text onto the reasons the dashboard can act on. */
-function classify(message: string): IndexError {
+function classify(message: string, errorName?: string): IndexError {
   const normalised = message.toLowerCase();
+  // Error 7041, or the binding's own not-found error class. Terminal: the item
+  // is gone, so a caller waiting for it to finish indexing never will.
+  if (
+    errorName === "AiSearchNotFoundError" ||
+    normalised.includes("item_not_found") ||
+    normalised.includes("not found")
+  ) {
+    return { kind: "rejected", reason: "not_found", message };
+  }
   if (normalised.includes("over_size") || normalised.includes("maximum size")) {
     return { kind: "rejected", reason: "too_large", message };
   }
@@ -72,6 +86,43 @@ function classify(message: string): IndexError {
     return { kind: "rejected", reason: "empty", message };
   }
   return { kind: "unavailable", message };
+}
+
+/** Every throw from the binding reaches `classify` the same way. */
+function fromThrown(cause: unknown): IndexError {
+  return cause instanceof Error ? classify(cause.message, cause.name) : classify(String(cause));
+}
+
+/**
+ * `upload` and `status` are handed the same item shape, so they settle it the
+ * same way: parse it, turn a terminal status into a rejection, and fold
+ * `outdated` into `queued`.
+ */
+function toIndexedItem(raw: unknown): Result<IndexedItem, IndexError> {
+  const parsed = itemInfo.safeParse(raw);
+  if (!parsed.success) {
+    return err({
+      kind: "unavailable",
+      message: "AI Search returned an item in an unrecognised shape",
+    });
+  }
+
+  const item = parsed.data;
+  if (item.status === "error" || item.status === "skipped") {
+    return err(classify(item.error ?? `AI Search reported status ${item.status}`));
+  }
+
+  // `outdated` means a previously indexed item has gone stale and is due to be
+  // reindexed. For both callers that is the same "not settled yet" as `queued`,
+  // so it folds in rather than becoming a state of its own.
+  const status = item.status === "outdated" ? "queued" : item.status;
+
+  return ok({
+    itemId: item.id,
+    key: item.key,
+    status,
+    chunkCount: item.chunks_count ?? null,
+  });
 }
 
 export class AISearchIndexer implements Indexer {
@@ -124,32 +175,29 @@ export class AISearchIndexer implements Indexer {
         timeoutMs: this.#timeoutMs,
       });
     } catch (cause) {
-      return err(classify(cause instanceof Error ? cause.message : String(cause)));
+      return err(fromThrown(cause));
     }
 
-    const parsed = itemInfo.safeParse(raw);
-    if (!parsed.success) {
-      return err({
-        kind: "unavailable",
-        message: "AI Search returned an item in an unrecognised shape",
-      });
+    return toIndexedItem(raw);
+  }
+
+  /**
+   * Where the item got to after `upload` stopped polling, which is what turns a
+   * row left in `indexing` into a terminal state.
+   *
+   * Reads through `get` rather than create-or-get: by the time anything asks,
+   * the upload has already created the instance, and a status read has no
+   * business creating one.
+   */
+  async status(tenantId: TenantId, itemId: string): Promise<Result<IndexedItem, IndexError>> {
+    let raw: unknown;
+    try {
+      raw = await this.#namespace.get(instanceId(tenantId)).items.get(itemId).info();
+    } catch (cause) {
+      return err(fromThrown(cause));
     }
 
-    const item = parsed.data;
-    if (item.status === "error" || item.status === "skipped") {
-      return err(classify(item.error ?? `AI Search reported status ${item.status}`));
-    }
-
-    // `outdated` marks a previously indexed item as stale, which cannot apply to
-    // a fresh upload. Fold it into `queued` rather than inventing a state.
-    const status = item.status === "outdated" ? "queued" : item.status;
-
-    return ok({
-      itemId: item.id,
-      key: item.key,
-      status,
-      chunkCount: item.chunks_count ?? null,
-    });
+    return toIndexedItem(raw);
   }
 
   async remove(tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>> {

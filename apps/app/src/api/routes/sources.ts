@@ -119,7 +119,7 @@ sources.put("/", requireSession, async (c) => {
   );
 
   try {
-    await env.INGEST.send({ tenantId, sourceId });
+    await env.INGEST.send({ kind: "index", tenantId, sourceId });
   } catch (cause) {
     // The row stays in `uploaded` and the object stays in R2, so nothing is
     // lost and nothing is duplicated. Recovering it belongs to the cron sweep

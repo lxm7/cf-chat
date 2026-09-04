@@ -63,7 +63,7 @@ export interface IndexedItem {
   /**
    * `completed` means searchable now. `queued` and `running` mean indexing
    * outlived our poll window, which is not a failure: the item keeps indexing
-   * and the row is reconciled on the next read.
+   * and a delayed check message settles the row later by calling `status`.
    */
   readonly status: "queued" | "running" | "completed";
   readonly chunkCount: number | null;
@@ -73,7 +73,12 @@ export type IndexError =
   | { readonly kind: "unavailable"; readonly message: string }
   | {
       readonly kind: "rejected";
-      readonly reason: "too_large" | "unsupported_type" | "empty";
+      /**
+       * `not_found` is terminal like the rest: the index no longer holds the
+       * item, so no amount of waiting brings it back. Without it a status check
+       * would treat a deleted item as a transient failure and re-arm forever.
+       */
+      readonly reason: "too_large" | "unsupported_type" | "empty" | "not_found";
       readonly message: string;
     };
 
@@ -88,5 +93,11 @@ export type IndexError =
  */
 export interface Indexer {
   upload(tenantId: TenantId, doc: IndexableDocument): Promise<Result<IndexedItem, IndexError>>;
+  /**
+   * Where an item got to since `upload` stopped watching. On the interface
+   * rather than in a reader of its own because any implementation that can
+   * index has to be able to answer this to be swappable at all.
+   */
+  status(tenantId: TenantId, itemId: string): Promise<Result<IndexedItem, IndexError>>;
   remove(tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>>;
 }

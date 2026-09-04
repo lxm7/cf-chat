@@ -5,6 +5,8 @@ import type { SourceRow } from "@cf-chat/db/schema";
 import { AISearchIndexer, type Indexer } from "@cf-chat/retrieval";
 import {
   AI_SEARCH_MAX_BYTES,
+  INDEX_CHECK_DELAY_SECONDS,
+  MAX_INDEX_CHECKS,
   type SourceId,
   sourceIdSchema,
   type TenantId,
@@ -16,13 +18,40 @@ import { withDb } from "./api/db.ts";
 /**
  * Queue messages cross a trust boundary like any other input: a malformed or
  * stale message must not take the consumer down, it must be dealt with.
+ *
+ * Two kinds ride the same queue. `index` uploads the R2 object; `check` asks
+ * AI Search whether an upload that outlived the poll window has finished. They
+ * are a union rather than one shape with optional fields so the consumer cannot
+ * read `attempt` on a message that has no business carrying one.
  */
-const ingestMessage = z.object({
+const indexMessage = z.object({
+  kind: z.literal("index"),
   tenantId: tenantIdSchema,
   sourceId: sourceIdSchema,
 });
 
+const checkMessage = z.object({
+  kind: z.literal("check"),
+  tenantId: tenantIdSchema,
+  sourceId: sourceIdSchema,
+  /** 1 for the check armed by the upload itself, incrementing from there. */
+  attempt: z.number().int().positive(),
+});
+
+/**
+ * `kind` did not exist when the first messages were enqueued, so a body without
+ * one is an upload from the older producer. Defaulting it keeps anything
+ * already sitting in a queue working instead of being discarded as malformed.
+ */
+const ingestMessage = z.preprocess(
+  (raw) =>
+    typeof raw === "object" && raw !== null && !("kind" in raw) ? { ...raw, kind: "index" } : raw,
+  z.discriminatedUnion("kind", [indexMessage, checkMessage]),
+);
+
 export type IngestMessage = z.infer<typeof ingestMessage>;
+type IndexMessage = z.infer<typeof indexMessage>;
+type CheckMessage = z.infer<typeof checkMessage>;
 
 /**
  * Everything the ingest step touches, injected rather than reached for.
@@ -41,6 +70,12 @@ export interface IngestDeps {
     tenantId: TenantId,
     sourceId: SourceId,
     update: SourceStatusUpdate,
+  ) => Promise<void>;
+  /** Enqueues a delayed `check` for a row that is still indexing. */
+  readonly scheduleCheck: (
+    tenantId: TenantId,
+    sourceId: SourceId,
+    attempt: number,
   ) => Promise<void>;
 }
 
@@ -62,6 +97,9 @@ export function needsConversion(contentType: string, sizeBytes: number): boolean
   return sizeBytes > AI_SEARCH_MAX_BYTES || contentType === "application/pdf";
 }
 
+/** How long the delayed checks cover before a row is called failed. */
+const INDEX_TIMEOUT_MINUTES = Math.round((MAX_INDEX_CHECKS * INDEX_CHECK_DELAY_SECONDS) / 60);
+
 /**
  * One message. Never throws: every outcome is either "done, ack it" (true) or
  * "transient, put it back" (false), so a poison file cannot stall the queue.
@@ -73,7 +111,23 @@ export async function ingestOne(raw: unknown, deps: IngestDeps): Promise<boolean
     console.error("Discarding unparseable ingest message", raw);
     return true;
   }
-  const { tenantId, sourceId } = parsed.data;
+
+  const message = parsed.data;
+  switch (message.kind) {
+    case "index":
+      return handleIndex(message, deps);
+    case "check":
+      return handleCheck(message, deps);
+    default: {
+      const never: never = message;
+      throw new Error(`Unhandled ingest message ${JSON.stringify(never)}`);
+    }
+  }
+}
+
+/** Upload the stored object into the index. */
+async function handleIndex(message: IndexMessage, deps: IngestDeps): Promise<boolean> {
+  const { tenantId, sourceId } = message;
 
   const row = await deps.findSource(tenantId, sourceId);
   if (!row) {
@@ -82,6 +136,12 @@ export async function ingestOne(raw: unknown, deps: IngestDeps): Promise<boolean
   }
   if (row.status === "ready") {
     return true; // Already indexed by an earlier delivery.
+  }
+  // A duplicate delivery of a row already handed to AI Search must not send the
+  // bytes again. Asking where that item got to is both cheaper and the same
+  // question the check messages ask.
+  if (row.status === "indexing" && row.aiSearchItemId) {
+    return settle(tenantId, sourceId, row.aiSearchItemId, 1, deps);
   }
 
   await deps.setStatus(tenantId, sourceId, { status: "indexing" });
@@ -137,15 +197,116 @@ export async function ingestOne(raw: unknown, deps: IngestDeps): Promise<boolean
   }
 
   const item = uploaded.value;
+  if (item.status !== "completed") {
+    // Indexing outlived the poll window, which is not a failure: the item keeps
+    // indexing without us. Record the id we will need to ask about it, then arm
+    // the first check.
+    await deps.setStatus(tenantId, sourceId, {
+      status: "indexing",
+      aiSearchItemId: item.itemId,
+      chunkCount: item.chunkCount,
+      errorCode: null,
+      errorMessage: null,
+    });
+    await deps.scheduleCheck(tenantId, sourceId, 1);
+    return true;
+  }
+
   await deps.setStatus(tenantId, sourceId, {
-    // Indexing can outlive the poll window without having failed. Leaving the
-    // row in `indexing` is honest; a later delivery settles it.
-    status: item.status === "completed" ? "ready" : "indexing",
+    status: "ready",
     aiSearchItemId: item.itemId,
     chunkCount: item.chunkCount,
     errorCode: null,
     errorMessage: null,
   });
+  return true;
+}
+
+/** Ask AI Search whether an item that was still indexing has settled. */
+async function handleCheck(message: CheckMessage, deps: IngestDeps): Promise<boolean> {
+  const { tenantId, sourceId, attempt } = message;
+
+  const row = await deps.findSource(tenantId, sourceId);
+  if (!row) {
+    return true; // Deleted while the check was waiting.
+  }
+  if (row.status === "ready" || row.status === "error") {
+    return true; // Settled by another delivery.
+  }
+  if (!row.aiSearchItemId) {
+    // The row went backwards, which means an index message is in flight and
+    // owns it. Dropping this check avoids two messages racing on one row.
+    console.error("Check for a source with no index item", sourceId);
+    return true;
+  }
+
+  return settle(tenantId, sourceId, row.aiSearchItemId, attempt, deps);
+}
+
+/**
+ * The shared tail of both handlers: read the item, write a terminal status, or
+ * arm the next check.
+ */
+async function settle(
+  tenantId: TenantId,
+  sourceId: SourceId,
+  itemId: string,
+  attempt: number,
+  deps: IngestDeps,
+): Promise<boolean> {
+  const checked = await deps.indexer.status(tenantId, itemId);
+
+  if (!checked.ok) {
+    const failure = checked.error;
+    // An outage says nothing about this file, so it must not consume the row.
+    // Re-arming rather than retrying the message keeps one retry budget and one
+    // cap, and keeps an AI Search outage out of the dead letter queue.
+    if (failure.kind === "unavailable") {
+      return rearm(tenantId, sourceId, attempt, deps);
+    }
+    await deps.setStatus(tenantId, sourceId, {
+      status: "error",
+      errorCode: failure.reason,
+      errorMessage: failure.message,
+    });
+    return true;
+  }
+
+  const item = checked.value;
+  if (item.status !== "completed") {
+    return rearm(tenantId, sourceId, attempt, deps);
+  }
+
+  await deps.setStatus(tenantId, sourceId, {
+    status: "ready",
+    aiSearchItemId: item.itemId,
+    chunkCount: item.chunkCount,
+    errorCode: null,
+    errorMessage: null,
+  });
+  return true;
+}
+
+/**
+ * Schedule the next check, or give up. Giving up is a claim about our patience
+ * rather than about the file, so the message says the index may still finish.
+ */
+async function rearm(
+  tenantId: TenantId,
+  sourceId: SourceId,
+  attempt: number,
+  deps: IngestDeps,
+): Promise<boolean> {
+  if (attempt >= MAX_INDEX_CHECKS) {
+    await deps.setStatus(tenantId, sourceId, {
+      status: "error",
+      errorCode: "index_timeout",
+      errorMessage: `Still indexing after ${INDEX_TIMEOUT_MINUTES} minutes. It may finish on its own; upload the file again if it does not.`,
+    });
+    return true;
+  }
+
+  await deps.scheduleCheck(tenantId, sourceId, attempt + 1);
   return true;
 }
 
@@ -167,6 +328,12 @@ function liveDeps(): IngestDeps {
     setStatus: async (tenantId, sourceId, update) => {
       await withDb((db) =>
         withTenant(db, tenantId, (tx) => updateSourceStatus(tx, tenantId, sourceId, update)),
+      );
+    },
+    scheduleCheck: async (tenantId, sourceId, attempt) => {
+      await env.INGEST.send(
+        { kind: "check", tenantId, sourceId, attempt },
+        { delaySeconds: INDEX_CHECK_DELAY_SECONDS },
       );
     },
   };

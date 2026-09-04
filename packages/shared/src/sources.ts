@@ -17,6 +17,20 @@ export const AI_SEARCH_MAX_BYTES = 4 * 1024 * 1024;
 export const INBOUND_MAX_BYTES = 10 * 1024 * 1024;
 
 /**
+ * `uploadAndPoll` gives up after 30 seconds, which is not a failure: the item
+ * keeps indexing after we stop watching. These two govern the delayed check
+ * that settles the row afterwards.
+ */
+export const INDEX_CHECK_DELAY_SECONDS = 30;
+
+/**
+ * 20 checks at 30 seconds is 10 minutes, after which the row is called failed.
+ * The item may still finish indexing on AI Search's side, so the message says
+ * so rather than claiming the file is broken.
+ */
+export const MAX_INDEX_CHECKS = 20;
+
+/**
  * Convenience allowlist, not a correctness boundary. It exists so the dashboard
  * can reject an obviously wrong file immediately rather than after a queue
  * round trip. Anything that slips through still comes back from AI Search as

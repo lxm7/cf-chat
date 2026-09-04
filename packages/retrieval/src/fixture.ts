@@ -63,8 +63,11 @@ export class FixtureRetriever implements Retriever {
 export class FixtureIndexer implements Indexer {
   readonly uploaded = new Map<string, IndexableDocument & { readonly itemId: string }>();
   readonly removed: string[] = [];
+  readonly checked: string[] = [];
   #failure: IndexError | null;
   #calls = 0;
+  #uploadStatus: IndexedItem["status"] = "completed";
+  #statuses: Array<Result<IndexedItem, IndexError>> = [];
 
   constructor(failure: IndexError | null = null) {
     this.#failure = failure;
@@ -74,6 +77,23 @@ export class FixtureIndexer implements Indexer {
   failOnce(error: IndexError): void {
     this.#failure = error;
     this.#calls = 0;
+  }
+
+  /**
+   * Make uploads return without having finished indexing, which is the case
+   * that leaves a row in `indexing` and arms a check.
+   */
+  uploadsSettleAs(status: IndexedItem["status"]): void {
+    this.#uploadStatus = status;
+  }
+
+  /**
+   * Script what successive `status` calls return, so a test can walk a row from
+   * `running` to `completed` the way the real index would. The last entry
+   * repeats once the script runs out.
+   */
+  statusReturns(...results: Array<Result<IndexedItem, IndexError>>): void {
+    this.#statuses = [...results];
   }
 
   async upload(
@@ -89,12 +109,34 @@ export class FixtureIndexer implements Indexer {
 
     const itemId = `item-${tenantId}-${this.#calls}`;
     this.uploaded.set(itemId, { ...doc, itemId });
+    const chunks = typeof doc.content === "string" ? Math.ceil(doc.content.length / 512) : 1;
     return ok({
       itemId,
       key: doc.name,
-      status: "completed",
-      chunkCount: typeof doc.content === "string" ? Math.ceil(doc.content.length / 512) : 1,
+      status: this.#uploadStatus,
+      // Nothing is chunked until indexing completes, so an unfinished upload
+      // reports no count rather than a made-up one.
+      chunkCount: this.#uploadStatus === "completed" ? chunks : null,
     });
+  }
+
+  async status(tenantId: TenantId, itemId: string): Promise<Result<IndexedItem, IndexError>> {
+    this.checked.push(itemId);
+
+    const scripted = this.#statuses.length > 1 ? this.#statuses.shift() : this.#statuses[0];
+    if (scripted) {
+      return scripted;
+    }
+
+    const doc = this.uploaded.get(itemId);
+    if (!doc) {
+      return err({
+        kind: "rejected",
+        reason: "not_found",
+        message: `No such item ${itemId} for tenant ${tenantId}`,
+      });
+    }
+    return ok({ itemId, key: doc.name, status: "completed", chunkCount: 1 });
   }
 
   async remove(_tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>> {
