@@ -9,29 +9,29 @@
   "kv_namespaces": [
     {
       "binding": "KV",
-      // Replace with the id from `wrangler kv namespace create KV`.
-      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
-    }
+      "id": "9f91441982644c9a95246cf76e6c7be9",
+    },
   ],
 
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      // Replace with the id from `wrangler hyperdrive create cf-chat-neon --connection-string=...`.
-      "id": "REPLACE_WITH_HYPERDRIVE_ID"
+      // Config id only. The Neon credentials live in the Hyperdrive config on
+      // Cloudflare's side, set once at `wrangler hyperdrive create` time.
+      "id": "516d5b5a80ae45ada647976484e3dcdb",
       // Local dev reads CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE
       // from the environment rather than a connection string committed here.
-    }
+    },
   ],
 
   // ADR-007. `destinations` is deliberately absent until the OTLP destination
   // open item in docs/plan.md is settled; traces still land in the dashboard.
   "observability": {
     "traces": {
-      "enabled": true
+      "enabled": true,
     },
     "logs": {
-      "enabled": true
-    }
-  }
+      "enabled": true,
+    },
+  },
 }
