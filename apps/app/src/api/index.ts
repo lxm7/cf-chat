@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import type { SessionVariables } from "./middleware/session.ts";
 import auth from "./routes/auth.ts";
 import session from "./routes/session.ts";
+import sources from "./routes/sources.ts";
 import tenants from "./routes/tenants.ts";
 
 export const api = new Hono<{ Variables: SessionVariables }>().basePath("/api");
@@ -12,6 +13,7 @@ api.get("/health", (c) => c.json({ status: "ok" }));
 api.route("/auth", auth);
 api.route("/tenants", tenants);
 api.route("/session", session);
+api.route("/sources", sources);
 
 /**
  * The single place AppError becomes a response. Details are only serialised

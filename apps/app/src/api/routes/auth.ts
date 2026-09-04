@@ -61,9 +61,11 @@ auth.post("/signup", async (c) => {
     const userId = newUserId();
     const passwordHash = await hashPassword(input.password);
 
-    // The whole signup is one transaction with app.tenant_id set, so the RLS
-    // WITH CHECK policies on tenants and memberships are satisfied by the
-    // tenant we are in the middle of creating.
+    // One transaction because the three inserts have to succeed or fail
+    // together, with app.tenant_id set for consistency with every other write
+    // path. The identity tables deliberately carry no RLS (migration 0001), so
+    // the GUC is not what makes these inserts legal; the policies that do
+    // require it start at `sources`.
     return withTenant(db, tenantId, async (tx) => {
       const tenant = await insertTenant(tx, { id: tenantId, name: input.tenantName, slug });
       const user = await insertUser(tx, {

@@ -45,3 +45,48 @@ export interface Retriever {
 }
 
 export const DEFAULT_SEARCH_LIMIT = 8;
+
+export interface IndexableDocument {
+  /**
+   * Becomes the item key in the index, and upload is an upsert keyed on it, so
+   * it must be unique per source and stable across retries. Two sources with
+   * the same filename must not collide.
+   */
+  readonly name: string;
+  readonly content: ReadableStream | Blob | string;
+  readonly metadata?: Readonly<Record<string, string>>;
+}
+
+export interface IndexedItem {
+  readonly itemId: string;
+  readonly key: string;
+  /**
+   * `completed` means searchable now. `queued` and `running` mean indexing
+   * outlived our poll window, which is not a failure: the item keeps indexing
+   * and the row is reconciled on the next read.
+   */
+  readonly status: "queued" | "running" | "completed";
+  readonly chunkCount: number | null;
+}
+
+export type IndexError =
+  | { readonly kind: "unavailable"; readonly message: string }
+  | {
+      readonly kind: "rejected";
+      readonly reason: "too_large" | "unsupported_type" | "empty";
+      readonly message: string;
+    };
+
+/**
+ * The write half of the retrieval seam, symmetrical with `Retriever` so both
+ * sides of ADR-002's escape hatch are swappable rather than just the read side.
+ * See ADR-012 for what a non-AI-Search implementation would have to provide.
+ *
+ * Returns a Result for the same reason `Retriever` does: an ingest failure is
+ * an expected outcome that belongs on the source row, not an exception that
+ * poisons a queue batch.
+ */
+export interface Indexer {
+  upload(tenantId: TenantId, doc: IndexableDocument): Promise<Result<IndexedItem, IndexError>>;
+  remove(tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>>;
+}

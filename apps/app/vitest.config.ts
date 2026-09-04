@@ -15,6 +15,7 @@ export default defineConfig({
         compatibilityDate: "2026-08-22",
         compatibilityFlags: ["nodejs_compat"],
         kvNamespaces: ["KV"],
+        r2Buckets: ["KNOWLEDGE"],
         bindings: { SESSION_SECRET: "test-secret-not-a-real-key" },
       },
     }),
@@ -22,7 +23,9 @@ export default defineConfig({
   test: {
     name: "app",
     include: ["test/**/*.test.ts"],
-    // `pg` is CommonJS and reaches the pool through the API route graph. The
-    // Workers module system needs it pre-bundled to ESM first.
+    // AI Search and Hyperdrive have no local emulation, so neither is declared
+    // here: the ingest consumer takes its dependencies as arguments and tests
+    // supply FixtureIndexer and a stub database. R2 is emulated, so the
+    // consumer reads real objects.
   },
 });

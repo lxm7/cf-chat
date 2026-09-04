@@ -17,6 +17,53 @@
     }
   ],
 
+  "r2_buckets": [
+    {
+      "binding": "KNOWLEDGE",
+      "bucket_name": "cf-chat-knowledge"
+    }
+  ],
+
+  // Workers AI, used by the ingest consumer for `toMarkdown`. AI Search caps
+  // files at 4MB; converting anything larger (or any PDF) to markdown first
+  // brings it back under the cap and improves chunking. See ADR-011.
+  "ai": {
+    "binding": "AI"
+  },
+
+  // Namespace binding rather than an instance binding: instances are created
+  // per tenant at runtime, which the instance binding cannot do. Requires a
+  // compatibility date of 2026-03-27 or later. `remote` because AI Search has
+  // no local emulation, so `vite dev` proxies to the real service; tests use
+  // FixtureIndexer and never reach this binding.
+  "ai_search_namespaces": [
+    {
+      "binding": "AI_SEARCH",
+      "namespace": "default",
+      "remote": true
+    }
+  ],
+
+  "queues": {
+    "producers": [
+      {
+        "binding": "INGEST",
+        "queue": "cf-chat-ingest"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "cf-chat-ingest",
+        // Each message can spend up to 30s in uploadAndPoll, so a full batch
+        // is ~150s sequential, well inside the 15 minute consumer wall clock.
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "cf-chat-ingest-dlq"
+      }
+    ]
+  },
+
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",

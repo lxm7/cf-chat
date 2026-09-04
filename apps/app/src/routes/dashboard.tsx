@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { ApiError, apiFetch, type MeResponse } from "../api-client.ts";
 
@@ -61,9 +61,11 @@ function Dashboard() {
   return (
     <main>
       <h1>Dashboard</h1>
-      <p className="lede">
-        Signed in. The inbox, knowledge sources and widget config arrive in later build steps.
-      </p>
+      <p className="lede">Signed in. The inbox and widget config arrive in later build steps.</p>
+
+      <nav>
+        <Link to="/sources">Knowledge sources</Link>
+      </nav>
 
       <h2>Workspaces</h2>
       <ul className="tenants">

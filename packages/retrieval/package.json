@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cf-chat/shared": "workspace:*"
+    "@cf-chat/shared": "workspace:*",
+    "zod": "4.5.4"
   }
 }

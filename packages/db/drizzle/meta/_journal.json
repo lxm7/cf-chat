@@ -15,6 +15,20 @@
       "when": 1788438741693,
       "tag": "0001_app_role_and_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788506167764,
+      "tag": "0002_clumsy_korath",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788506168764,
+      "tag": "0003_sources_rls",
+      "breakpoints": true
     }
   ]
 }

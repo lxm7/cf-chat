@@ -52,3 +52,21 @@ export interface MeResponse {
   readonly activeTenantId: string | null;
   readonly tenants: readonly TenantSummary[];
 }
+
+export type SourceStatus = "uploaded" | "indexing" | "ready" | "error";
+
+export interface SourceSummary {
+  readonly id: string;
+  readonly filename: string;
+  readonly contentType: string;
+  readonly sizeBytes: number;
+  readonly status: SourceStatus;
+  readonly chunkCount: number | null;
+  readonly errorMessage: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface SourcesResponse {
+  readonly sources: readonly SourceSummary[];
+}
