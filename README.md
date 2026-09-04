@@ -79,6 +79,11 @@ each Worker with:
 
 ## Notes
 
+- `main` in `apps/app/wrangler.jsonc` points at `./src/server.ts`, deliberately,
+  not at `@tanstack/react-start/server-entry` as the Cloudflare framework guide
+  shows. That package export is a self-contained default entry that never imports
+  our server file, so pointing `main` at it silently drops the Hono API and every
+  named export while the build still succeeds. See ADR-010.
 - `compatibility_date` is pinned to `2026-08-22` across dev, test and deploy.
   That is the newest date the test pool's bundled runtime accepts; letting the
   three drift is not worth the twelve days.

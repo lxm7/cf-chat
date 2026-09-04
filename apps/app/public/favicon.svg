@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>cf-chat</title>
+  <rect width="32" height="32" rx="7" fill="#1f2430"/>
+  <path d="M8 11.5A2.5 2.5 0 0 1 10.5 9h11A2.5 2.5 0 0 1 24 11.5v7a2.5 2.5 0 0 1-2.5 2.5H15l-5 4v-4h-.5A1.5 1.5 0 0 1 8 19.5z" fill="#f4f6fb"/>
+  <circle cx="13" cy="15" r="1.4" fill="#1f2430"/>
+  <circle cx="17" cy="15" r="1.4" fill="#1f2430"/>
+  <circle cx="21" cy="15" r="1.4" fill="#1f2430"/>
+</svg>
