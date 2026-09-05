@@ -184,9 +184,32 @@ describe("AISearchIndexer", () => {
     expect(result).toMatchObject({ ok: false, error: { kind: "rejected", reason } });
   });
 
-  it("treats the documented timeout_error code as retryable, not terminal", async () => {
+  it.each(["timeout_error", "workers_ai_timeout_error"])(
+    "treats %s reported *on an item* as terminal, not as work still in flight",
+    async (code) => {
+      // An item that reports status `error` has a verdict. Re-reading it returns
+      // the same answer, so a caller that treats this as retryable re-polls a
+      // finished failure until its check budget runs out. That is exactly what
+      // happened to a 5MB PDF: it failed instantly and we polled for 10 minutes.
+      const fake = fakeNamespace({
+        item: { id: "i", key: "f", status: "error", error: code },
+      });
+
+      const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+        name: "f",
+        content: "hi",
+      });
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { kind: "rejected", reason: "processing_timeout" },
+      });
+    },
+  );
+
+  it("treats an unrecognised code on a failed item as terminal too", async () => {
     const fake = fakeNamespace({
-      item: { id: "i", key: "f", status: "error", error: "timeout_error" },
+      item: { id: "i", key: "f", status: "error", error: "some_future_error_code" },
     });
 
     const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
@@ -194,7 +217,26 @@ describe("AISearchIndexer", () => {
       content: "hi",
     });
 
-    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+    expect(result).toMatchObject({
+      ok: false,
+      error: { kind: "rejected", reason: "processing_failed" },
+    });
+  });
+
+  it("still treats a thrown timeout as work in flight, not as a verdict", async () => {
+    // The mirror of the case above, and the reason the two classifiers are
+    // separate: a thrown timeout is our poll giving up, not the item failing.
+    const fake = fakeNamespace({
+      uploadThrows: new Error("uploadAndPoll timed out after 30000ms"),
+      listResult: { result: [{ id: "item-9", key: "f", status: "running", chunks_count: null }] },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "f",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: true, value: { status: "running" } });
   });
 
   it("recovers a timed-out upload by finding the item it created", async () => {

@@ -203,6 +203,27 @@ async function handleIndex(message: IndexMessage, deps: IngestDeps): Promise<boo
     return true;
   }
 
+  // Conversion is the whole reason the inbound cap (10MB) is allowed to exceed
+  // AI Search's (4MB): markdown of a large text document is far smaller than the
+  // original. Nothing guaranteed that, though. A file whose markdown is still
+  // over the cap was uploaded anyway and came back `over_size`, which reads to
+  // the user as an arbitrary failure after they were told 10MB was fine.
+  // Checked here so the message names conversion as the reason.
+  if (converting && typeof content === "string") {
+    const convertedBytes = new TextEncoder().encode(content).byteLength;
+    if (convertedBytes > AI_SEARCH_MAX_BYTES) {
+      await deps.setStatus(tenantId, sourceId, {
+        status: "error",
+        errorCode: "too_large",
+        errorMessage:
+          `Converted to ${Math.round(convertedBytes / 1024 / 1024)}MB of text, over the ` +
+          `${Math.floor(AI_SEARCH_MAX_BYTES / 1024 / 1024)}MB indexing limit. ` +
+          "Split the document into smaller files and upload them separately.",
+      });
+      return true;
+    }
+  }
+
   const uploaded = await deps.indexer.upload(tenantId, {
     name: itemName(sourceId, converting ? markdownFilename(row.filename) : row.filename),
     content,
@@ -336,8 +357,32 @@ async function handleDelete(message: DeleteMessage, deps: IngestDeps): Promise<b
     return true;
   }
 
-  if (row.aiSearchItemId) {
-    const removed = await deps.indexer.remove(tenantId, row.aiSearchItemId);
+  // An upload can create the item and then fail, which leaves the row with no
+  // id and the item unreachable: every failed upload used to leak one item into
+  // the index permanently, counting against the per-instance file limit and
+  // surviving even TenantOffboard. The key is derived the same way the upload
+  // derived it, so it is recoverable without having been recorded.
+  let itemId = row.aiSearchItemId;
+  if (!itemId) {
+    const key = itemName(
+      sourceId,
+      needsConversion(row.contentType, row.sizeBytes)
+        ? markdownFilename(row.filename)
+        : row.filename,
+    );
+    const found = await deps.indexer.findByKey(tenantId, key);
+    if (!found.ok) {
+      // Same rule as the removal below: an outage says nothing about the item.
+      if (found.error.kind === "unavailable") {
+        return false;
+      }
+    } else if (found.value) {
+      itemId = found.value.itemId;
+    }
+  }
+
+  if (itemId) {
+    const removed = await deps.indexer.remove(tenantId, itemId);
     // An item the index no longer holds is the state this is trying to reach.
     // An outage says nothing about the item, so that one goes back on the queue.
     if (!removed.ok && removed.error.kind === "unavailable") {
@@ -398,6 +443,17 @@ async function settle(
 
   const item = checked.value;
   if (item.status !== "completed") {
+    // Progress, not a failure, so this is a log rather than an error. Without
+    // it a row sits in `indexing` for up to ten minutes while the checks run
+    // silently, and there is no way to tell a file that is still working from
+    // one that is never going to finish.
+    console.log("Item still indexing, re-arming", {
+      sourceId,
+      itemId: item.itemId,
+      status: item.status,
+      attempt,
+      of: MAX_INDEX_CHECKS,
+    });
     return rearm(tenantId, sourceId, attempt, deps);
   }
 

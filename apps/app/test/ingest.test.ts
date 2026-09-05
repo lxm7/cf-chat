@@ -134,6 +134,37 @@ describe("ingest", () => {
     expect([...indexer.uploaded.values()][0]?.name).toBe(itemName(sourceId, "cv.pdf"));
   });
 
+  it("rejects a file whose markdown is still over the indexing cap", async () => {
+    // The inbound cap is 10MB and AI Search's is 4MB. Conversion is what
+    // bridges them, and nothing guaranteed it succeeded: an oversized result
+    // used to be uploaded anyway and come back as an opaque `over_size`.
+    const { sourceId, row, deps, indexer, updates } = harness({
+      row: { filename: "manual.pdf", contentType: "application/pdf", sizeBytes: 9 * 1024 * 1024 },
+      convert: async () => "x".repeat(5 * 1024 * 1024),
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "%PDF-1.4 body");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+
+    expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "too_large" });
+    // Named as a conversion result, not as an arbitrary rejection.
+    expect(updates.at(-1)?.errorMessage).toContain("Converted to");
+    // And never sent: the point is to not spend the upload at all.
+    expect(indexer.uploaded.size).toBe(0);
+  });
+
+  it("accepts a large file whose markdown comes in under the cap", async () => {
+    const { sourceId, row, deps, indexer, updates } = harness({
+      row: { filename: "manual.pdf", contentType: "application/pdf", sizeBytes: 9 * 1024 * 1024 },
+      convert: async () => "# Manual\n\nShort text.",
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "%PDF-1.4 body");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ status: "ready" });
+    expect(indexer.uploaded.size).toBe(1);
+  });
+
   it("names a converted item .md so the key matches what we actually sent", async () => {
     // AI Search dispatches its converter on the key's extension. Markdown under
     // a `.pdf` key comes back `unable_to_convert_to_markdown`.
@@ -524,6 +555,71 @@ describe("index timeouts", () => {
 
     expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
     expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "unsupported_type" });
+  });
+});
+
+describe("deleting a source that never got an item id", () => {
+  it("finds the leaked item by key and removes it", async () => {
+    // An upload can create the item and then fail, so the row has no id. Those
+    // items used to be unreachable and stayed in the index forever, one per
+    // failed upload, counting against the per-instance file limit.
+    const indexer = new FixtureIndexer();
+    const { sourceId, row, deps } = harness({
+      indexer,
+      row: { filename: "cv.pdf", contentType: "application/pdf", sizeBytes: 1024 },
+    });
+    // Stand in for the item AI Search created before the upload reported failure.
+    await indexer.upload(tenantId, { name: itemName(sourceId, "cv.pdf"), content: "x" });
+    row.status = "deleting";
+    row.aiSearchItemId = null;
+
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(true);
+
+    expect(indexer.lookedUp).toContain(itemName(sourceId, "cv.pdf"));
+    expect(indexer.removed).toHaveLength(1);
+  });
+
+  it("looks under the .md key for a source that was converted", async () => {
+    const indexer = new FixtureIndexer();
+    const { sourceId, row, deps } = harness({
+      indexer,
+      row: {
+        filename: "book.pdf",
+        contentType: "application/pdf",
+        sizeBytes: 9 * 1024 * 1024,
+      },
+    });
+    row.status = "deleting";
+    row.aiSearchItemId = null;
+
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(true);
+
+    // The key has to match what the upload would have used, or the lookup
+    // silently finds nothing and the item leaks anyway.
+    expect(indexer.lookedUp).toContain(itemName(sourceId, "book.md"));
+  });
+
+  it("still reaps the row when the index holds nothing under the key", async () => {
+    const indexer = new FixtureIndexer();
+    const { sourceId, row, deps, reaped } = harness({ indexer });
+    row.status = "deleting";
+    row.aiSearchItemId = null;
+
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(true);
+    expect(indexer.removed).toEqual([]);
+    expect(reaped).toContain(sourceId);
+  });
+
+  it("retries rather than reaping the row when the lookup hits an outage", async () => {
+    // Reaping here would strand the item: the row is the only thing that still
+    // knows the key it was stored under.
+    const indexer = new FixtureIndexer({ kind: "unavailable", message: "AI Search is down" });
+    const { sourceId, row, deps, reaped } = harness({ indexer });
+    row.status = "deleting";
+    row.aiSearchItemId = null;
+
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(false);
+    expect(reaped).toEqual([]);
   });
 });
 

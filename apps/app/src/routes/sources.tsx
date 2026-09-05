@@ -82,7 +82,10 @@ function Sources() {
       // The browser sets content-length from the File itself.
       await apiFetch<SourceSummary>("/api/sources", {
         method: "PUT",
-        headers: { "x-filename": file.name, "content-type": "application/octet-stream" },
+        headers: {
+          "x-filename": file.name,
+          "content-type": "application/octet-stream",
+        },
         body: file,
       });
       await load();

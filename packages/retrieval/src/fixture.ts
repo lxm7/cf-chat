@@ -63,6 +63,7 @@ export class FixtureRetriever implements Retriever {
 export class FixtureIndexer implements Indexer {
   readonly uploaded = new Map<string, IndexableDocument & { readonly itemId: string }>();
   readonly removed: string[] = [];
+  readonly lookedUp: string[] = [];
   readonly checked: string[] = [];
   #failure: IndexError | null;
   #calls = 0;
@@ -137,6 +138,30 @@ export class FixtureIndexer implements Indexer {
       });
     }
     return ok({ itemId, key: doc.name, status: "completed", chunkCount: 1 });
+  }
+
+  /**
+   * Keyed on the document name the upload was given, which is what the real
+   * index keys an item on. Mirrors the production contract: `ok(null)` for a
+   * key the index does not hold.
+   */
+  async findByKey(
+    _tenantId: TenantId,
+    key: string,
+  ): Promise<Result<IndexedItem | null, IndexError>> {
+    if (this.#failure) {
+      const failure = this.#failure;
+      this.#failure = null;
+      return err(failure);
+    }
+    this.lookedUp.push(key);
+
+    for (const [itemId, doc] of this.uploaded) {
+      if (doc.name === key) {
+        return ok({ itemId, key, status: "completed", chunkCount: null });
+      }
+    }
+    return ok(null);
   }
 
   async remove(_tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>> {

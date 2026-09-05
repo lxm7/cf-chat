@@ -79,6 +79,37 @@ const listItems = z.object({
   result: z.array(itemInfo),
 });
 
+/**
+ * An error the index reports *about an item*, as opposed to one thrown at us.
+ *
+ * The distinction is load-bearing and getting it wrong cost ten minutes of
+ * pointless polling per file: a thrown timeout means the item is still in
+ * flight and should be reconciled, while `status: "error"` means AI Search
+ * finished and reached a verdict. Re-reading that verdict returns the same
+ * answer however many times we ask, so nothing here is ever retryable.
+ *
+ * Cloudflare's own guidance agrees: the recommended action for `timeout_error`
+ * is to sync the item again, not to wait for it.
+ */
+function classifyItemError(message: string): IndexError {
+  const classified = classify(message);
+  switch (classified.kind) {
+    case "rejected":
+      return classified;
+    case "timeout":
+      return { kind: "rejected", reason: "processing_timeout", message };
+    // An unrecognised code on a failed item is still a failed item. Reporting it
+    // as an outage sends the caller back to poll an item that has already
+    // finished failing.
+    case "unavailable":
+      return { kind: "rejected", reason: "processing_failed", message };
+    default: {
+      const exhaustive: never = classified;
+      throw new Error(`Unhandled index error: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
 /** Map AI Search's own error text onto the reasons the dashboard can act on. */
 function classify(message: string, errorName?: string): IndexError {
   const normalised = message.toLowerCase();
@@ -146,7 +177,7 @@ function toIndexedItem(raw: unknown): Result<IndexedItem, IndexError> {
 
   const item = parsed.data;
   if (item.status === "error" || item.status === "skipped") {
-    return err(classify(item.error ?? `AI Search reported status ${item.status}`));
+    return err(classifyItemError(item.error ?? `AI Search reported status ${item.status}`));
   }
 
   // `outdated` means a previously indexed item has gone stale and is due to be
@@ -230,9 +261,11 @@ export class AISearchIndexer implements Indexer {
       // pending, so the caller takes the same reconcile path it takes when the
       // poll returns an unfinished item (ADR-011.8).
       if (failure.kind === "timeout") {
-        const pending = await this.#findByKey(instance, doc.name);
-        if (pending) {
-          return pending;
+        const pending = await this.#findByKeyOn(instance, doc.name);
+        // Only a found item helps here. A failed lookup, or an index that holds
+        // nothing under the key, both leave the original timeout standing.
+        if (pending.ok && pending.value) {
+          return ok(pending.value);
         }
       }
       return err(failure);
@@ -242,29 +275,52 @@ export class AISearchIndexer implements Indexer {
   }
 
   /**
-   * The item behind a key, or null when the lookup itself fails or finds
-   * nothing. Returns null rather than an error because the only caller is a
-   * best-effort recovery: if this cannot answer, the original failure stands.
+   * The item stored under a key. `ok(null)` means the index holds nothing there,
+   * which is a real answer rather than a failure: a delete asking after an item
+   * that was never created is already in the state it wants.
    */
-  async #findByKey(
+  async findByKey(
+    tenantId: TenantId,
+    key: string,
+  ): Promise<Result<IndexedItem | null, IndexError>> {
+    let instance: AiSearchInstanceLike;
+    try {
+      instance = this.#namespace.get(instanceId(tenantId));
+    } catch (cause) {
+      return err(fromThrown(cause));
+    }
+    return this.#findByKeyOn(instance, key);
+  }
+
+  /**
+   * The lookup against an instance we already hold, so the post-timeout path in
+   * `upload` does not resolve the instance a second time.
+   */
+  async #findByKeyOn(
     instance: AiSearchInstanceLike,
     key: string,
-  ): Promise<Result<IndexedItem, IndexError> | null> {
+  ): Promise<Result<IndexedItem | null, IndexError>> {
     let raw: unknown;
     try {
       raw = await instance.items.list({ key, per_page: 1 });
-    } catch {
-      return null;
+    } catch (cause) {
+      return err(fromThrown(cause));
     }
 
     const parsed = listItems.safeParse(raw);
     if (!parsed.success) {
-      return null;
+      return err({
+        kind: "unavailable",
+        message: "AI Search returned an item list in an unrecognised shape",
+      });
     }
     // Filtered again on the exact key: `key` is documented as an exact filter,
-    // but a widened match would otherwise reconcile against the wrong item.
+    // but a widened match would otherwise address the wrong item.
     const match = parsed.data.result.find((item) => item.key === key);
-    return match ? toIndexedItem(match) : null;
+    if (!match) {
+      return ok(null);
+    }
+    return toIndexedItem(match);
   }
 
   /**

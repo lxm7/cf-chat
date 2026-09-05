@@ -85,7 +85,16 @@ export type IndexError =
        * item, so no amount of waiting brings it back. Without it a status check
        * would treat a deleted item as a transient failure and re-arm forever.
        */
-      readonly reason: "too_large" | "unsupported_type" | "empty" | "unreadable" | "not_found";
+      readonly reason:
+        | "too_large"
+        | "unsupported_type"
+        | "empty"
+        | "unreadable"
+        | "not_found"
+        /** The index gave up processing the item. It does not resume on its own. */
+        | "processing_timeout"
+        /** The index failed the item for a reason we do not have a name for. */
+        | "processing_failed";
       readonly message: string;
     };
 
@@ -106,5 +115,14 @@ export interface Indexer {
    * index has to be able to answer this to be swappable at all.
    */
   status(tenantId: TenantId, itemId: string): Promise<Result<IndexedItem, IndexError>>;
+  /**
+   * The item stored under a key, or null when there is none.
+   *
+   * On the interface because an id is not always available: an upload can
+   * create the item and then fail, leaving nothing on our side to address it
+   * by. Without a lookup those items are unreachable and accumulate against the
+   * per-instance file limit forever.
+   */
+  findByKey(tenantId: TenantId, key: string): Promise<Result<IndexedItem | null, IndexError>>;
   remove(tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>>;
 }
