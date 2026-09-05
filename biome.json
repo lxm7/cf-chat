@@ -12,7 +12,9 @@
       "!**/.wrangler",
       "!**/.output",
       "!**/worker-configuration.d.ts",
-      "!**/drizzle"
+      "!**/drizzle",
+      "!.claude",
+      "!.mcp.json"
     ]
   },
   "formatter": {

@@ -7,7 +7,9 @@
   // Hono API and any named exports. See ADR-003.
   "main": "./src/server.ts",
   "compatibility_date": "2026-08-22",
-  // nodejs_compat is required by the `pg` driver used to reach Neon via Hyperdrive.
+  // nodejs_compat is required by postgres.js (the `postgres` package, chosen in
+  // ADR-009), which reaches Neon through the Hyperdrive binding over a raw TCP
+  // socket and so needs node:net, node:tls and node:crypto.
   "compatibility_flags": ["nodejs_compat"],
 
   "kv_namespaces": [

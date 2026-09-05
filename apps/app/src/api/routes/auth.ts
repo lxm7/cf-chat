@@ -10,6 +10,7 @@ import {
 } from "@cf-chat/db";
 import {
   AppError,
+  absentUserHash,
   clearedSessionCookie,
   hashPassword,
   loginInput,
@@ -27,13 +28,6 @@ import { withDb } from "../db.ts";
 import { requireSession, type SessionVariables } from "../middleware/session.ts";
 import { issueSession, revokeSession } from "../session.ts";
 import { parseBody } from "../validation.ts";
-
-/**
- * A syntactically valid hash that no password matches. Verified against when
- * the email is unknown, so login costs the same whether or not the account
- * exists and cannot be used to enumerate users.
- */
-const ABSENT_USER_HASH = `pbkdf2$sha256$210000$${"A".repeat(22)}$${"A".repeat(43)}`;
 
 async function reserveSlug(db: Db, name: string): Promise<string> {
   const base = slugify(name) || "tenant";
@@ -100,7 +94,7 @@ auth.post("/login", async (c) => {
   const outcome = await withDb(async (db) => {
     const user = await findUserByEmail(db, input.email);
     if (!user) {
-      await verifyPassword(input.password, ABSENT_USER_HASH);
+      await verifyPassword(input.password, absentUserHash());
       return null;
     }
     if (!(await verifyPassword(input.password, user.passwordHash))) {
