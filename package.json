@@ -14,7 +14,8 @@
     "format": "biome check --write .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "cf-typegen": "turbo run cf-typegen"
+    "cf-typegen": "turbo run cf-typegen",
+    "wrangler:tail": "cd apps/app && npx wrangler tail cf-chat-app --format pretty"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",
