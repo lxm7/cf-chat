@@ -114,10 +114,44 @@ describe("ingest", () => {
     expect(itemName(first, "faq.md")).not.toBe(itemName(second, "faq.md"));
   });
 
-  it("converts anything over the AI Search cap before uploading", () => {
+  it("converts on size alone, since AI Search converts what it accepts anyway", () => {
     expect(needsConversion("text/markdown", 5 * 1024 * 1024)).toBe(true);
-    expect(needsConversion("application/pdf", 1024)).toBe(true);
+    expect(needsConversion("application/pdf", 5 * 1024 * 1024)).toBe(true);
+    // A PDF under the cap goes up as bytes. Converting it first bought nothing
+    // and produced markdown under a `.pdf` key, which AI Search rejected.
+    expect(needsConversion("application/pdf", 1024)).toBe(false);
     expect(needsConversion("text/markdown", 1024)).toBe(false);
+  });
+
+  it("sends a small PDF as bytes under its own name", async () => {
+    const { sourceId, row, deps, indexer, updates } = harness({
+      row: { filename: "cv.pdf", contentType: "application/pdf", sizeBytes: 1024 },
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "%PDF-1.4 body");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ status: "ready" });
+    expect([...indexer.uploaded.values()][0]?.name).toBe(itemName(sourceId, "cv.pdf"));
+  });
+
+  it("names a converted item .md so the key matches what we actually sent", async () => {
+    // AI Search dispatches its converter on the key's extension. Markdown under
+    // a `.pdf` key comes back `unable_to_convert_to_markdown`.
+    const { sourceId, row, deps, indexer } = harness({
+      row: {
+        filename: "book.pdf",
+        contentType: "application/pdf",
+        sizeBytes: 5 * 1024 * 1024,
+      },
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "%PDF-1.4 body");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+
+    const uploaded = [...indexer.uploaded.values()][0];
+    expect(uploaded?.name).toBe(itemName(sourceId, "book.md"));
+    expect(uploaded?.name.endsWith(".pdf")).toBe(false);
+    expect(typeof uploaded?.content).toBe("string");
   });
 
   it("retries a transient index failure rather than burning the row", async () => {
@@ -155,7 +189,8 @@ describe("ingest", () => {
 
   it("records an error when conversion produces nothing", async () => {
     const { sourceId, row, deps, updates } = harness({
-      row: { contentType: "application/pdf" },
+      // Over the cap, which is the only thing that puts us on the conversion path.
+      row: { contentType: "application/pdf", sizeBytes: 5 * 1024 * 1024 },
       convert: async () => {
         throw new Error("Markdown conversion produced no text");
       },
@@ -447,6 +482,51 @@ describe("ingest deletion", () => {
  * three attempts on the main queue, so nothing is retried: the only question is
  * what the row should say once we have given up on it.
  */
+describe("index timeouts", () => {
+  it("does not re-send bytes for an upload that is still indexing", async () => {
+    // A poll timeout means the upload was accepted and indexing is in flight.
+    // Retrying would upload the same file again, three times, and then dead
+    // letter a file that was very likely fine.
+    const indexer = new FixtureIndexer({ kind: "timeout", message: "uploadAndPoll timed out" });
+    const { sourceId, row, deps, updates } = harness({ indexer });
+    await env.KNOWLEDGE.put(row.r2Key, "Refunds take five days.");
+
+    const done = await ingestOne(message(tenantId, sourceId), deps);
+
+    expect(done).toBe(true); // acked, not retried
+    expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "index_timeout" });
+    expect(updates.at(-1)?.errorMessage).toContain("timed out");
+  });
+
+  it("re-arms rather than consuming the row when a status check times out", async () => {
+    const indexer = new FixtureIndexer();
+    indexer.statusReturns({ ok: false, error: { kind: "timeout", message: "status timed out" } });
+    const { sourceId, deps, updates, checks } = harness({
+      indexer,
+      row: { status: "indexing", aiSearchItemId: "item-1" },
+    });
+
+    expect(await ingestOne(check(tenantId, sourceId, 1), deps)).toBe(true);
+
+    // A slow read says nothing about the file, so the row must survive it.
+    expect(checks.at(-1)).toMatchObject({ attempt: 2 });
+    expect(updates.some((u) => u.status === "error")).toBe(false);
+  });
+
+  it("still fails a genuine rejection rather than waiting on it", async () => {
+    const indexer = new FixtureIndexer({
+      kind: "rejected",
+      reason: "unsupported_type",
+      message: "content type not supported",
+    });
+    const { sourceId, row, deps, updates } = harness({ indexer });
+    await env.KNOWLEDGE.put(row.r2Key, "Refunds take five days.");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "unsupported_type" });
+  });
+});
+
 describe("ingest dead letter", () => {
   it("writes a terminal status on a row still waiting to be indexed", async () => {
     const { sourceId, deps, updates } = harness({ row: { status: "uploaded" } });
@@ -464,6 +544,41 @@ describe("ingest dead letter", () => {
 
     expect(await deadLetterOne(check(tenantId, sourceId, 3), deps)).toBe(true);
     expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "dlq" });
+  });
+
+  it("keeps the last real error instead of replacing it with the generic one", async () => {
+    // The retry path writes the real failure to the row on every attempt. This
+    // handler used to overwrite it, which is what made a dead-lettered file
+    // impossible to diagnose from either the row or the logs.
+    const { sourceId, deps, updates } = harness({
+      row: { status: "uploaded", errorCode: "retrying", errorMessage: "AI Search returned 503" },
+    });
+
+    expect(await deadLetterOne(message(tenantId, sourceId), deps)).toBe(true);
+
+    const last = updates.at(-1);
+    expect(last).toMatchObject({ status: "error", errorCode: "dlq" });
+    expect(last?.errorMessage).toContain("AI Search returned 503");
+    expect(last?.errorMessage).toContain("given up on");
+  });
+
+  it("still says something useful when there was no recorded error", async () => {
+    const { sourceId, deps, updates } = harness({
+      row: { status: "uploaded", errorMessage: null },
+    });
+
+    expect(await deadLetterOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates.at(-1)?.errorMessage).toContain("given up on");
+    expect(updates.at(-1)?.errorMessage).not.toContain("Last error");
+  });
+
+  it("ignores a blank recorded error rather than appending an empty tail", async () => {
+    const { sourceId, deps, updates } = harness({
+      row: { status: "uploaded", errorMessage: "   " },
+    });
+
+    expect(await deadLetterOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates.at(-1)?.errorMessage).not.toContain("Last error");
   });
 
   it("leaves a row that settled on another delivery alone", async () => {

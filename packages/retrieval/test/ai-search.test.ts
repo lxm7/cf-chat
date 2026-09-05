@@ -15,6 +15,9 @@ interface FakeOptions {
   readonly uploadThrows?: Error;
   readonly info?: unknown;
   readonly infoThrows?: Error;
+  /** What `items.list` returns, for the post-timeout lookup by key. */
+  readonly listResult?: unknown;
+  readonly listThrows?: Error;
 }
 
 /** Records what the binding was asked to do, so the calls can be asserted on. */
@@ -22,6 +25,7 @@ function fakeNamespace(options: FakeOptions = {}) {
   const created: string[] = [];
   const gotten: string[] = [];
   const uploads: Array<{ name: string; instance: string }> = [];
+  const listed: Array<{ key: string | undefined; instance: string }> = [];
   const inspected: Array<{ itemId: string; instance: string }> = [];
   const deleted: string[] = [];
 
@@ -31,6 +35,11 @@ function fakeNamespace(options: FakeOptions = {}) {
         if (options.uploadThrows) throw options.uploadThrows;
         uploads.push({ name, instance: id });
         return options.item ?? { id: "item-1", key: name, status: "completed", chunks_count: 3 };
+      },
+      list: async (params) => {
+        listed.push({ key: params?.key, instance: id });
+        if (options.listThrows) throw options.listThrows;
+        return options.listResult ?? { result: [] };
       },
       get: (itemId) => {
         inspected.push({ itemId, instance: id });
@@ -66,7 +75,7 @@ function fakeNamespace(options: FakeOptions = {}) {
     },
   };
 
-  return { namespace, created, gotten, uploads, inspected, deleted };
+  return { namespace, created, gotten, uploads, listed, inspected, deleted };
 }
 
 describe("instanceId", () => {
@@ -150,6 +159,149 @@ describe("AISearchIndexer", () => {
     });
 
     expect(result).toMatchObject({ ok: false, error: { kind: "unavailable" } });
+  });
+
+  it.each([
+    ["unable_to_convert_to_markdown", "unsupported_type"],
+    ["invalid_pdf", "unsupported_type"],
+    ["file_is_corrupt", "unreadable"],
+    ["file_is_password_locked", "unreadable"],
+    ["file_content_empty", "empty"],
+    ["markdown_conversion_empty", "empty"],
+    ["markdown_too_large", "too_large"],
+    ["chunk_too_large_for_storage", "too_large"],
+  ])("treats the documented code %s as a terminal %s", async (code, reason) => {
+    // These all fail identically on every retry. Read as an outage, each one
+    // burns three attempts and then dead-letters a file we could have rejected
+    // immediately with a message the user can act on.
+    const fake = fakeNamespace({ item: { id: "i", key: "f", status: "error", error: code } });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "f",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "rejected", reason } });
+  });
+
+  it("treats the documented timeout_error code as retryable, not terminal", async () => {
+    const fake = fakeNamespace({
+      item: { id: "i", key: "f", status: "error", error: "timeout_error" },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "f",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+  });
+
+  it("recovers a timed-out upload by finding the item it created", async () => {
+    // `uploadAndPoll` gives up by throwing, but the item is still indexing.
+    // Reported as a failure, the retry re-sends the bytes for work already in
+    // flight, three times, then dead-letters a file that was fine.
+    const fake = fakeNamespace({
+      uploadThrows: new Error("uploadAndPoll timed out after 30000ms"),
+      listResult: {
+        result: [{ id: "item-9", key: "faq.md", status: "running", chunks_count: null }],
+      },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    // Pending, not failed: the caller records the id and arms a check.
+    expect(result).toEqual({
+      ok: true,
+      value: { itemId: "item-9", key: "faq.md", status: "running", chunkCount: null },
+    });
+    expect(fake.listed.at(-1)?.key).toBe("faq.md");
+  });
+
+  it("reports the timeout when the item cannot be found afterwards", async () => {
+    const fake = fakeNamespace({
+      uploadThrows: new Error("uploadAndPoll timed out after 30000ms"),
+      listResult: { result: [] },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+  });
+
+  it("does not reconcile against an item with a different key", async () => {
+    // A widened match on the server side would otherwise attach this row to
+    // some other tenant's item and report it ready.
+    const fake = fakeNamespace({
+      uploadThrows: new Error("uploadAndPoll timed out after 30000ms"),
+      listResult: { result: [{ id: "other", key: "somebody-else.md", status: "completed" }] },
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+  });
+
+  it("keeps the timeout when the lookup itself fails", async () => {
+    const fake = fakeNamespace({
+      uploadThrows: new Error("uploadAndPoll timed out after 30000ms"),
+      listThrows: new Error("list is down too"),
+    });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+  });
+
+  it("does not look anything up when the failure is not a timeout", async () => {
+    const fake = fakeNamespace({ uploadThrows: new Error("connection reset") });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "unavailable" } });
+    expect(fake.listed).toEqual([]);
+  });
+
+  it("classifies a timeout by error name as well as message", async () => {
+    const named = new Error("gave up waiting");
+    named.name = "TimeoutError";
+    const fake = fakeNamespace({ uploadThrows: named });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "timeout" } });
+  });
+
+  it("keeps the original message on every classification, so nothing is lost", async () => {
+    const fake = fakeNamespace({ uploadThrows: new Error("connection reset by peer") });
+
+    const result = await new AISearchIndexer(fake.namespace).upload(tenantId, {
+      name: "faq.md",
+      content: "hi",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.message).toContain("connection reset by peer");
+    }
   });
 
   it("refuses to trust a response in an unexpected shape", async () => {

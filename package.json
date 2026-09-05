@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "cf-typegen": "turbo run cf-typegen",
+    "deploy": "pnpm --filter @cf-chat/app run deploy && pnpm --filter @cf-chat/widget run deploy",
     "wrangler:tail": "cd apps/app && npx wrangler tail cf-chat-app --format pretty"
   },
   "devDependencies": {

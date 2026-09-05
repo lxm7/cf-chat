@@ -71,6 +71,13 @@ export interface IndexedItem {
 
 export type IndexError =
   | { readonly kind: "unavailable"; readonly message: string }
+  /**
+   * The upload was accepted but indexing outlived our poll window, and the
+   * binding reported that by throwing rather than returning a pending item.
+   * Distinct from `unavailable` because nothing is wrong: retrying re-sends
+   * bytes for work that is already in flight. Callers should reconcile instead.
+   */
+  | { readonly kind: "timeout"; readonly message: string }
   | {
       readonly kind: "rejected";
       /**
@@ -78,7 +85,7 @@ export type IndexError =
        * item, so no amount of waiting brings it back. Without it a status check
        * would treat a deleted item as a transient failure and re-arm forever.
        */
-      readonly reason: "too_large" | "unsupported_type" | "empty" | "not_found";
+      readonly reason: "too_large" | "unsupported_type" | "empty" | "unreadable" | "not_found";
       readonly message: string;
     };
 

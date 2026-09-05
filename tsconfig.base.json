@@ -1,5 +1,10 @@
 {
   "compilerOptions": {
+    // Every package here runs in the Workers runtime with nodejs_compat, so
+    // both type sets are legitimately available. Packages that need something
+    // different (apps/app, apps/widget) override this wholesale, since `types`
+    // replaces rather than merges.
+    "types": ["@cloudflare/workers-types", "node"],
     "target": "ES2022",
     "lib": ["ES2023"],
     "module": "preserve",

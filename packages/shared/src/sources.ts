@@ -72,6 +72,19 @@ export function sourceFileExtension(filename: string): string {
   return dot === -1 ? "" : filename.slice(dot).toLowerCase();
 }
 
+/**
+ * The name an item takes once we have converted it ourselves. AI Search keys an
+ * item on its filename and dispatches its converter on that extension, so
+ * markdown uploaded under the original `.pdf` name comes back rejected with
+ * `unable_to_convert_to_markdown`. Keeping the stem preserves the readable name
+ * in the dashboard and the index alike.
+ */
+export function markdownFilename(filename: string): string {
+  const extension = sourceFileExtension(filename);
+  const stem = extension ? filename.slice(0, -extension.length) : filename;
+  return `${stem}.md`;
+}
+
 export function isSupportedSourceFile(filename: string): boolean {
   return sourceFileExtension(filename) in CONTENT_TYPE_BY_EXTENSION;
 }

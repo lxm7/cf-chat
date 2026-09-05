@@ -21,6 +21,12 @@ export interface AiSearchItems {
       timeoutMs?: number;
     },
   ): Promise<unknown>;
+  /**
+   * Declared structurally like the rest of this file rather than pulled from
+   * workers-types. Only `key` is used here: the binding documents it as the
+   * item's exact object key, unique per source.
+   */
+  list(params?: { key?: string; per_page?: number }): Promise<unknown>;
   get(itemId: string): AiSearchItem;
   delete(itemId: string): Promise<unknown>;
 }
@@ -64,27 +70,58 @@ const itemInfo = z.object({
   error: z.string().nullish(),
 });
 
+/**
+ * The list endpoint's envelope. Parsed at the boundary like every other binding
+ * response: this one is only read after a timeout, which is exactly when a
+ * surprise in the shape would be least welcome.
+ */
+const listItems = z.object({
+  result: z.array(itemInfo),
+});
+
 /** Map AI Search's own error text onto the reasons the dashboard can act on. */
 function classify(message: string, errorName?: string): IndexError {
   const normalised = message.toLowerCase();
-  // Error 7041, or the binding's own not-found error class. Terminal: the item
-  // is gone, so a caller waiting for it to finish indexing never will.
-  if (
-    errorName === "AiSearchNotFoundError" ||
-    normalised.includes("item_not_found") ||
-    normalised.includes("not found")
-  ) {
+
+  // Matched against AI Search's published indexing error codes rather than
+  // guessed from prose, so a wording change upstream cannot silently reclassify
+  // a permanent failure as a retryable one:
+  // developers.cloudflare.com/ai-search/troubleshooting/indexing-error-codes/
+  const has = (...codes: readonly string[]) => codes.some((code) => normalised.includes(code));
+
+  // Terminal: the item is gone, so a caller waiting for it to finish never will.
+  if (errorName === "AiSearchNotFoundError" || has("item_not_found", "not found")) {
     return { kind: "rejected", reason: "not_found", message };
   }
-  if (normalised.includes("over_size") || normalised.includes("maximum size")) {
+  // Terminal: too big at some stage of the pipeline. Re-sending the same bytes
+  // produces the same verdict.
+  if (has("over_size", "maximum size", "markdown_too_large", "chunk_too_large_for_storage")) {
     return { kind: "rejected", reason: "too_large", message };
   }
-  if (normalised.includes("unsupported") || normalised.includes("content type")) {
+  // Terminal: AI Search cannot turn this format into text. `unable_to_convert_to_markdown`
+  // is the one that used to fall through to `unavailable` and burn three retries.
+  if (has("unable_to_convert_to_markdown", "invalid_pdf", "unsupported", "content type")) {
     return { kind: "rejected", reason: "unsupported_type", message };
   }
-  if (normalised.includes("empty") || normalised.includes("conversion_empty")) {
+  // Terminal, and distinct from an unsupported type: the format is fine and this
+  // particular file is not, so the fix is a different file rather than a
+  // different format.
+  if (has("file_is_corrupt", "file_is_password_locked")) {
+    return { kind: "rejected", reason: "unreadable", message };
+  }
+  // Terminal: converted, but there was nothing in it to index.
+  if (has("file_content_empty", "markdown_conversion_empty", "conversion_empty", "empty")) {
     return { kind: "rejected", reason: "empty", message };
   }
+  // `uploadAndPoll` gives up by throwing, not by returning a pending item, so
+  // without this a slow index is indistinguishable from an outage and gets its
+  // bytes re-sent on every retry until the message dead-letters.
+  if (errorName === "TimeoutError" || has("timeout_error", "timed out", "timeout")) {
+    return { kind: "timeout", message };
+  }
+  // Anything unrecognised is assumed transient. That is the safe default for a
+  // queue, but it means a novel permanent failure burns three retries before
+  // surfacing, so the message is logged by the caller rather than discarded.
   return { kind: "unavailable", message };
 }
 
@@ -167,18 +204,67 @@ export class AISearchIndexer implements Indexer {
     tenantId: TenantId,
     doc: IndexableDocument,
   ): Promise<Result<IndexedItem, IndexError>> {
+    // Resolved in its own step so the catch below can rely on having an
+    // instance to look the item up through. Folding both into one try would
+    // mean the recovery path referencing a binding that may never have been
+    // assigned.
+    let instance: AiSearchInstanceLike;
+    try {
+      instance = await this.#instance(tenantId);
+    } catch (cause) {
+      return err(fromThrown(cause));
+    }
+
     let raw: unknown;
     try {
-      const instance = await this.#instance(tenantId);
       raw = await instance.items.uploadAndPoll(doc.name, doc.content, {
         ...(doc.metadata ? { metadata: { ...doc.metadata } } : {}),
         timeoutMs: this.#timeoutMs,
       });
     } catch (cause) {
-      return err(fromThrown(cause));
+      const failure = fromThrown(cause);
+      // `uploadAndPoll` gives up by throwing, but the item it created is still
+      // indexing: the binding's own message says to inspect the item status.
+      // Reporting that as a failure would re-send the bytes on every retry for
+      // work already in flight. Look the item up by key and hand it back as
+      // pending, so the caller takes the same reconcile path it takes when the
+      // poll returns an unfinished item (ADR-011.8).
+      if (failure.kind === "timeout") {
+        const pending = await this.#findByKey(instance, doc.name);
+        if (pending) {
+          return pending;
+        }
+      }
+      return err(failure);
     }
 
     return toIndexedItem(raw);
+  }
+
+  /**
+   * The item behind a key, or null when the lookup itself fails or finds
+   * nothing. Returns null rather than an error because the only caller is a
+   * best-effort recovery: if this cannot answer, the original failure stands.
+   */
+  async #findByKey(
+    instance: AiSearchInstanceLike,
+    key: string,
+  ): Promise<Result<IndexedItem, IndexError> | null> {
+    let raw: unknown;
+    try {
+      raw = await instance.items.list({ key, per_page: 1 });
+    } catch {
+      return null;
+    }
+
+    const parsed = listItems.safeParse(raw);
+    if (!parsed.success) {
+      return null;
+    }
+    // Filtered again on the exact key: `key` is documented as an exact filter,
+    // but a widened match would otherwise reconcile against the wrong item.
+    const match = parsed.data.result.find((item) => item.key === key);
+    return match ? toIndexedItem(match) : null;
   }
 
   /**

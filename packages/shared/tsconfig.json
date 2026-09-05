@@ -1,9 +1,4 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    // "node" is here for node:crypto, which password.ts uses for scrypt and
-    // which nodejs_compat provides in the Workers runtime.
-    "types": ["@cloudflare/workers-types", "node"]
-  },
   "include": ["src", "test"]
 }

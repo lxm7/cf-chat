@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   contentTypeForSourceFile,
   isSupportedSourceFile,
+  markdownFilename,
   sanitizeFilename,
   sourceFileExtension,
 } from "../src/sources.ts";
@@ -60,5 +61,24 @@ describe("source file types", () => {
     expect(contentTypeForSourceFile("faq.md")).toBe("text/markdown");
     expect(contentTypeForSourceFile("manual.pdf")).toBe("application/pdf");
     expect(contentTypeForSourceFile("mystery.bin")).toBe("application/octet-stream");
+  });
+});
+
+describe("markdownFilename", () => {
+  it("swaps the extension for .md", () => {
+    expect(markdownFilename("CV_Alex_Moreton.pdf")).toBe("CV_Alex_Moreton.md");
+    expect(markdownFilename("report.docx")).toBe("report.md");
+  });
+
+  it("keeps a stem containing dots intact", () => {
+    expect(markdownFilename("q1.2026.report.pdf")).toBe("q1.2026.report.md");
+  });
+
+  it("appends rather than mangling a name with no extension", () => {
+    expect(markdownFilename("handbook")).toBe("handbook.md");
+  });
+
+  it("is idempotent, so a markdown file keeps its name", () => {
+    expect(markdownFilename("faq.md")).toBe("faq.md");
   });
 });
