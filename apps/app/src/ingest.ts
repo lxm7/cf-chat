@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import type { SourceStatusUpdate } from "@cf-chat/db";
-import { findSource, updateSourceStatus, withTenant } from "@cf-chat/db";
+import { deleteSource, findSource, updateSourceStatus, withTenant } from "@cf-chat/db";
 import type { SourceRow } from "@cf-chat/db/schema";
 import { AISearchIndexer, type Indexer } from "@cf-chat/retrieval";
 import {
@@ -39,6 +39,18 @@ const checkMessage = z.object({
 });
 
 /**
+ * Cleanup behind a tombstone. The row is already marked `deleting` by the time
+ * this is enqueued, so the message carries no state of its own: everything the
+ * cleanup needs is on the row, and the row is what proves the cleanup is still
+ * outstanding. See ADR-013.
+ */
+const deleteMessage = z.object({
+  kind: z.literal("delete"),
+  tenantId: tenantIdSchema,
+  sourceId: sourceIdSchema,
+});
+
+/**
  * `kind` did not exist when the first messages were enqueued, so a body without
  * one is an upload from the older producer. Defaulting it keeps anything
  * already sitting in a queue working instead of being discarded as malformed.
@@ -46,12 +58,13 @@ const checkMessage = z.object({
 const ingestMessage = z.preprocess(
   (raw) =>
     typeof raw === "object" && raw !== null && !("kind" in raw) ? { ...raw, kind: "index" } : raw,
-  z.discriminatedUnion("kind", [indexMessage, checkMessage]),
+  z.discriminatedUnion("kind", [indexMessage, checkMessage, deleteMessage]),
 );
 
 export type IngestMessage = z.infer<typeof ingestMessage>;
 type IndexMessage = z.infer<typeof indexMessage>;
 type CheckMessage = z.infer<typeof checkMessage>;
+type DeleteMessage = z.infer<typeof deleteMessage>;
 
 /**
  * Everything the ingest step touches, injected rather than reached for.
@@ -63,7 +76,7 @@ type CheckMessage = z.infer<typeof checkMessage>;
  */
 export interface IngestDeps {
   readonly indexer: Indexer;
-  readonly storage: Pick<R2Bucket, "get">;
+  readonly storage: Pick<R2Bucket, "get" | "delete">;
   readonly convert: (filename: string, blob: Blob) => Promise<string>;
   readonly findSource: (tenantId: TenantId, sourceId: SourceId) => Promise<SourceRow | undefined>;
   readonly setStatus: (
@@ -77,6 +90,8 @@ export interface IngestDeps {
     sourceId: SourceId,
     attempt: number,
   ) => Promise<void>;
+  /** Reaps the tombstone once the index item and the R2 object are gone. */
+  readonly hardDelete: (tenantId: TenantId, sourceId: SourceId) => Promise<void>;
 }
 
 /**
@@ -118,6 +133,8 @@ export async function ingestOne(raw: unknown, deps: IngestDeps): Promise<boolean
       return handleIndex(message, deps);
     case "check":
       return handleCheck(message, deps);
+    case "delete":
+      return handleDelete(message, deps);
     default: {
       const never: never = message;
       throw new Error(`Unhandled ingest message ${JSON.stringify(never)}`);
@@ -133,6 +150,11 @@ async function handleIndex(message: IndexMessage, deps: IngestDeps): Promise<boo
   if (!row) {
     console.error("Ingest message for a source that no longer exists", sourceId);
     return true; // Deleted while queued.
+  }
+  if (row.status === "deleting") {
+    // Tombstoned while this was queued. The delete message owns the row now,
+    // and indexing a file on its way out would race that cleanup.
+    return true;
   }
   if (row.status === "ready") {
     return true; // Already indexed by an earlier delivery.
@@ -233,6 +255,9 @@ async function handleCheck(message: CheckMessage, deps: IngestDeps): Promise<boo
   if (row.status === "ready" || row.status === "error") {
     return true; // Settled by another delivery.
   }
+  if (row.status === "deleting") {
+    return true; // Tombstoned while the check was waiting.
+  }
   if (!row.aiSearchItemId) {
     // The row went backwards, which means an index message is in flight and
     // owns it. Dropping this check avoids two messages racing on one row.
@@ -241,6 +266,43 @@ async function handleCheck(message: CheckMessage, deps: IngestDeps): Promise<boo
   }
 
   return settle(tenantId, sourceId, row.aiSearchItemId, attempt, deps);
+}
+
+/**
+ * Cleanup behind a tombstone: index item, then R2 object, then the row.
+ *
+ * The row is reaped last because it is the only record that cleanup is still
+ * outstanding. Deleting it first would leave an index item and an object with
+ * nothing left to find them, which is the failure mode the tombstone exists to
+ * avoid (ADR-013).
+ */
+async function handleDelete(message: DeleteMessage, deps: IngestDeps): Promise<boolean> {
+  const { tenantId, sourceId } = message;
+
+  const row = await deps.findSource(tenantId, sourceId);
+  if (!row) {
+    return true; // Cleanup finished on an earlier delivery.
+  }
+  if (row.status !== "deleting") {
+    // The tombstone is what authorises destruction. A delete message for a live
+    // row means something enqueued out of band, and acting on it would remove a
+    // source nobody asked to remove.
+    console.error("Delete message for a source that is not marked deleting", sourceId);
+    return true;
+  }
+
+  if (row.aiSearchItemId) {
+    const removed = await deps.indexer.remove(tenantId, row.aiSearchItemId);
+    // An item the index no longer holds is the state this is trying to reach.
+    // An outage says nothing about the item, so that one goes back on the queue.
+    if (!removed.ok && removed.error.kind === "unavailable") {
+      return false;
+    }
+  }
+
+  await deps.storage.delete(row.r2Key);
+  await deps.hardDelete(tenantId, sourceId);
+  return true;
 }
 
 /**
@@ -336,32 +398,108 @@ function liveDeps(): IngestDeps {
         { delaySeconds: INDEX_CHECK_DELAY_SECONDS },
       );
     },
+    hardDelete: async (tenantId, sourceId) => {
+      await withDb((db) => withTenant(db, tenantId, (tx) => deleteSource(tx, tenantId, sourceId)));
+    },
   };
 }
 
 /**
- * The `ingest` queue consumer, attached to the default export in `src/server.ts`
- * per ADR-010.
+ * A message that has exhausted the consumer's retries and landed in the dead
+ * letter queue. Without a consumer of its own the message dies silently and the
+ * row sits in `uploaded` or `indexing` forever, which the dashboard renders as a
+ * file that is permanently about to be ready.
  *
- * Messages are acked individually so a single poison file cannot drag a whole
- * batch back onto the queue, and are processed concurrently because each one
- * spends most of its time waiting on AI Search rather than burning CPU.
+ * The only job here is to write a terminal status. Nothing is retried: the
+ * message already had three attempts on the main queue.
+ */
+export async function deadLetterOne(raw: unknown, deps: IngestDeps): Promise<boolean> {
+  const parsed = ingestMessage.safeParse(raw);
+  if (!parsed.success) {
+    console.error("Unparseable message in the dead letter queue", raw);
+    return true;
+  }
+
+  const { tenantId, sourceId } = parsed.data;
+  const row = await deps.findSource(tenantId, sourceId);
+  if (!row) {
+    return true; // Deleted, or its cleanup finished, while this was failing.
+  }
+  if (row.status === "ready" || row.status === "error") {
+    return true; // A delivery that did succeed got there first.
+  }
+  if (row.status === "deleting") {
+    // The user deleted this source and the cleanup behind it ran out of
+    // attempts. Writing `error` here would resurrect a deleted file in the
+    // dashboard, so the tombstone stays for the step 8 sweep instead.
+    console.error("Cleanup exhausted its retries, leaving the tombstone", sourceId);
+    return true;
+  }
+
+  await deps.setStatus(tenantId, sourceId, {
+    status: "error",
+    errorCode: "dlq",
+    errorMessage: "Indexing failed repeatedly and was given up on. Upload the file again.",
+  });
+  return true;
+}
+
+/** Must match the queue names in `wrangler.jsonc`. */
+const INGEST_QUEUE = "cf-chat-ingest";
+const INGEST_DLQ = "cf-chat-ingest-dlq";
+
+/**
+ * The queue consumer, attached to the default export in `src/server.ts` per
+ * ADR-010. One Worker consumes both the `ingest` queue and its dead letter
+ * queue, so the batch's own queue name is what separates them.
  */
 export async function handleIngestBatch(batch: MessageBatch<unknown>): Promise<void> {
   // Deliberately not a defaulted second parameter: the runtime calls
   // queue(batch, env, ctx), so a defaulted `deps` would be silently replaced by
   // the env object at runtime while still typechecking.
-  return ingestBatch(batch, liveDeps());
+  const deps = liveDeps();
+
+  switch (batch.queue) {
+    case INGEST_DLQ:
+      return settleBatch(batch, (raw) => deadLetterOne(raw, deps));
+    case INGEST_QUEUE:
+      return ingestBatch(batch, deps);
+    default:
+      // Acked rather than thrown: a throw retries a batch that nobody is going
+      // to handle any better on the second attempt.
+      console.error("Batch from an unknown queue", batch.queue);
+      batch.ackAll();
+      return;
+  }
 }
 
 export async function ingestBatch(batch: MessageBatch<unknown>, deps: IngestDeps): Promise<void> {
+  return settleBatch(batch, (raw) => ingestOne(raw, deps));
+}
+
+export async function deadLetterBatch(
+  batch: MessageBatch<unknown>,
+  deps: IngestDeps,
+): Promise<void> {
+  return settleBatch(batch, (raw) => deadLetterOne(raw, deps));
+}
+
+/**
+ * Messages are acked individually so a single poison file cannot drag a whole
+ * batch back onto the queue, and are processed concurrently because each one
+ * spends most of its time waiting on AI Search rather than burning CPU.
+ */
+async function settleBatch(
+  batch: MessageBatch<unknown>,
+  handle: (raw: unknown) => Promise<boolean>,
+): Promise<void> {
   // The catch sits inside the map so the message reference survives a throw.
-  // ingestOne is written not to throw, so reaching it means a bug or an
+  // Both handlers are written not to throw, so reaching it means a bug or an
   // infrastructure failure, both of which deserve a retry rather than a drop.
   const outcomes = await Promise.all(
     batch.messages.map(async (message) => {
       try {
-        return { message, done: await ingestOne(message.body, deps) };
+        return { message, done: await handle(message.body) };
       } catch (cause) {
         console.error("Ingest threw unexpectedly", cause);
         return { message, done: false };

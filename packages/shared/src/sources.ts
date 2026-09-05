@@ -3,7 +3,16 @@
  * consumer and the dashboard.
  */
 
-export const SOURCE_STATUSES = ["uploaded", "indexing", "ready", "error"] as const;
+/**
+ * `deleting` is a tombstone, not a state a file rests in: the row is the record
+ * of what exists, so a delete writes it here first and the index item and the R2
+ * object are removed afterwards by the consumer, which then hard deletes the
+ * row. See ADR-013.
+ *
+ * Appended rather than slotted next to `ready` so the enum migration is a plain
+ * `ADD VALUE` with no `BEFORE` clause. The order carries no meaning.
+ */
+export const SOURCE_STATUSES = ["uploaded", "indexing", "ready", "error", "deleting"] as const;
 export type SourceStatus = (typeof SOURCE_STATUSES)[number];
 
 /**

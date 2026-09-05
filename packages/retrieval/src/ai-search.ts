@@ -200,15 +200,18 @@ export class AISearchIndexer implements Indexer {
     return toIndexedItem(raw);
   }
 
+  /**
+   * Classified like its siblings rather than reporting every throw as an
+   * outage. The distinction is what the delete cleanup decides on: `not_found`
+   * is the state a delete is trying to reach, so it acks, where `unavailable`
+   * is an outage that has to go back on the queue.
+   */
   async remove(tenantId: TenantId, itemId: string): Promise<Result<void, IndexError>> {
     try {
       await this.#namespace.get(instanceId(tenantId)).items.delete(itemId);
       return ok(undefined);
     } catch (cause) {
-      return err({
-        kind: "unavailable",
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
+      return err(fromThrown(cause));
     }
   }
 }

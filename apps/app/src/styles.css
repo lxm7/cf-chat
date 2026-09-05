@@ -104,6 +104,11 @@ ul.tenants li {
   font-size: 0.8125rem;
 }
 
+/* A row whose delete is committed but whose cleanup is still running. */
+ul.tenants li.pending {
+  opacity: 0.5;
+}
+
 nav a {
   color: var(--accent);
   margin-right: 1rem;

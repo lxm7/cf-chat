@@ -81,6 +81,29 @@ export async function updateSourceStatus(
   return rows[0];
 }
 
+/**
+ * Writes the tombstone. This is the moment a source stops existing as far as the
+ * product is concerned; removing it from the index and from R2 happens
+ * afterwards on the queue, and cannot change this answer. See ADR-013.
+ *
+ * Returns false when there is no such row, which the route turns into a 404.
+ * Marking a row that is already `deleting` succeeds, so a repeated DELETE is
+ * idempotent rather than an error.
+ */
+export async function markSourceDeleting(
+  db: Queryable,
+  tenantId: TenantId,
+  sourceId: SourceId,
+): Promise<boolean> {
+  const rows = await db
+    .update(sources)
+    .set({ status: "deleting", updatedAt: new Date() })
+    .where(and(eq(sources.tenantId, tenantId), eq(sources.id, sourceId)))
+    .returning({ id: sources.id });
+  return rows.length > 0;
+}
+
+/** The reap. Called by the consumer once the index and R2 are clean. */
 export async function deleteSource(
   db: Queryable,
   tenantId: TenantId,

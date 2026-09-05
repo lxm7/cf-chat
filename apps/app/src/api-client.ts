@@ -1,4 +1,8 @@
 /** Minimal typed fetch wrapper for the browser. Cookies carry the session, so credentials are always included. */
+import type { SourceStatus } from "@cf-chat/shared";
+
+export type { SourceStatus };
+
 export interface ApiErrorBody {
   readonly error: string;
   readonly message: string;
@@ -52,8 +56,6 @@ export interface MeResponse {
   readonly activeTenantId: string | null;
   readonly tenants: readonly TenantSummary[];
 }
-
-export type SourceStatus = "uploaded" | "indexing" | "ready" | "error";
 
 export interface SourceSummary {
   readonly id: string;

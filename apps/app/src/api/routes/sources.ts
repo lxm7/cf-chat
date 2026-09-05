@@ -1,7 +1,6 @@
 import { env } from "cloudflare:workers";
-import { deleteSource, findSource, insertSource, listSources, withTenant } from "@cf-chat/db";
+import { insertSource, listSources, markSourceDeleting, withTenant } from "@cf-chat/db";
 import type { SourceRow } from "@cf-chat/db/schema";
-import { AISearchIndexer } from "@cf-chat/retrieval";
 import {
   AppError,
   contentTypeForSourceFile,
@@ -140,23 +139,26 @@ sources.delete("/:id", requireSession, async (c) => {
   }
   const sourceId = parsed.data;
 
-  const row = await withDb((db) => findSource(db, tenantId, sourceId));
-  if (!row) {
+  // The row is the record of what exists, so the delete is decided here and
+  // nowhere else. Removing the index item and the R2 object happens afterwards
+  // on the queue and cannot change this answer: before ADR-013 a transient AI
+  // Search error meant the row could not be deleted at all, because the least
+  // authoritative system was gating the authoritative write.
+  const marked = await withDb((db) =>
+    withTenant(db, tenantId, (tx) => markSourceDeleting(tx, tenantId, sourceId)),
+  );
+  if (!marked) {
     throw new AppError("not_found", "No such knowledge source");
   }
 
-  // Index first, then storage, then the row. The row is the record that any of
-  // this happened, so it is deleted last: a failure anywhere leaves it in place
-  // and the whole delete stays retryable.
-  if (row.aiSearchItemId) {
-    const removed = await new AISearchIndexer(env.AI_SEARCH).remove(tenantId, row.aiSearchItemId);
-    if (!removed.ok) {
-      throw new AppError("internal", "Could not remove the source from the search index");
-    }
+  try {
+    await env.INGEST.send({ kind: "delete", tenantId, sourceId });
+  } catch (cause) {
+    // The tombstone is committed, so the source is gone as far as the product
+    // is concerned and the caller gets its 204 either way. The row stays
+    // `deleting` for the step 8 sweep to pick up. See docs/plan.md.
+    console.error("Could not enqueue cleanup for source", sourceId, cause);
   }
-
-  await env.KNOWLEDGE.delete(row.r2Key);
-  await withDb((db) => withTenant(db, tenantId, (tx) => deleteSource(tx, tenantId, sourceId)));
 
   return c.body(null, 204);
 });

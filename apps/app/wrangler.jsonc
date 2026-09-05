@@ -60,6 +60,19 @@
         "max_batch_timeout": 5,
         "max_retries": 3,
         "dead_letter_queue": "cf-chat-ingest-dlq"
+      },
+      {
+        // The same Worker consumes the dead letter queue, dispatched on
+        // `batch.queue`. Without a consumer these messages die silently and the
+        // row stays `uploaded` or `indexing` forever. The handler only writes a
+        // terminal status, so batches can be larger and finish in milliseconds.
+        "queue": "cf-chat-ingest-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        // No dead_letter_queue of its own: this is the end of the line. A
+        // message that fails three status writes here is dropped, and the cron
+        // sweep in build step 8 is what eventually notices the row.
+        "max_retries": 3
       }
     ]
   },

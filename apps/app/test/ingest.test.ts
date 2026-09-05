@@ -12,7 +12,13 @@ import {
   type TenantId,
 } from "@cf-chat/shared";
 import { beforeEach, describe, expect, it } from "vitest";
-import { type IngestDeps, ingestOne, itemName, needsConversion } from "../src/ingest.ts";
+import {
+  deadLetterOne,
+  type IngestDeps,
+  ingestOne,
+  itemName,
+  needsConversion,
+} from "../src/ingest.ts";
 
 const tenantId = newTenantId();
 
@@ -29,6 +35,7 @@ function harness(overrides?: {
   const indexer = overrides?.indexer ?? new FixtureIndexer();
   const updates: SourceStatusUpdate[] = [];
   const checks: Array<{ sourceId: SourceId; attempt: number }> = [];
+  const reaped: SourceId[] = [];
 
   const row: SourceRow = {
     id: sourceId,
@@ -51,7 +58,8 @@ function harness(overrides?: {
     indexer,
     storage: env.KNOWLEDGE,
     convert: overrides?.convert ?? (async () => "# Converted\n\nBody text."),
-    findSource: async (_tenant, id) => (id === sourceId ? row : undefined),
+    // A reaped row is gone, so later deliveries see what the consumer would.
+    findSource: async (_tenant, id) => (id === sourceId && !reaped.includes(id) ? row : undefined),
     // Applied to the row, not just recorded: a check reads back what the
     // upload wrote, so a spy that forgot the item id would test nothing.
     setStatus: async (_tenant, _id, update) => {
@@ -63,9 +71,12 @@ function harness(overrides?: {
     scheduleCheck: async (_tenant, id, attempt) => {
       checks.push({ sourceId: id, attempt });
     },
+    hardDelete: async (_tenant, id) => {
+      reaped.push(id);
+    },
   };
 
-  return { sourceId, row, deps, indexer, updates, checks };
+  return { sourceId, row, deps, indexer, updates, checks, reaped };
 }
 
 function message(tenantId: TenantId, sourceId: SourceId): unknown {
@@ -74,6 +85,10 @@ function message(tenantId: TenantId, sourceId: SourceId): unknown {
 
 function check(tenantId: TenantId, sourceId: SourceId, attempt: number): unknown {
   return { kind: "check", tenantId, sourceId, attempt };
+}
+
+function remove(tenantId: TenantId, sourceId: SourceId): unknown {
+  return { kind: "delete", tenantId, sourceId };
 }
 
 describe("ingest", () => {
@@ -316,5 +331,168 @@ describe("ingest reconciliation", () => {
     expect(done).toBe(true);
     expect(indexer.uploaded.size).toBe(0); // The bytes are not sent a second time.
     expect(updates.at(-1)).toMatchObject({ status: "ready", chunkCount: 2 });
+  });
+});
+
+/**
+ * Cleanup behind a tombstone (ADR-013). The row is already `deleting` by the
+ * time any of this runs: the delete was decided in Neon and these tests are
+ * about whether the cleanup behind it is safe to retry.
+ */
+describe("ingest deletion", () => {
+  function tombstoned(overrides?: { indexer?: FixtureIndexer }) {
+    return harness({
+      ...overrides,
+      row: { status: "deleting", aiSearchItemId: "item-1", chunkCount: 3 },
+    });
+  }
+
+  it("removes the index item, the object and then the row", async () => {
+    const { sourceId, row, deps, indexer, reaped } = tombstoned();
+    await env.KNOWLEDGE.put(row.r2Key, "Refunds take five days.");
+
+    const done = await ingestOne(remove(tenantId, sourceId), deps);
+
+    expect(done).toBe(true);
+    expect(indexer.removed).toEqual(["item-1"]);
+    expect(await env.KNOWLEDGE.get(row.r2Key)).toBeNull();
+    expect(reaped).toEqual([sourceId]);
+  });
+
+  it("retries without touching the row when the index is unavailable", async () => {
+    const indexer = new FixtureIndexer({ kind: "unavailable", message: "AI Search is down" });
+    const { sourceId, row, deps, reaped } = tombstoned({ indexer });
+    await env.KNOWLEDGE.put(row.r2Key, "Refunds take five days.");
+
+    const done = await ingestOne(remove(tenantId, sourceId), deps);
+
+    // The object and the row survive, so the whole cleanup stays retryable.
+    expect(done).toBe(false);
+    expect(await env.KNOWLEDGE.get(row.r2Key)).not.toBeNull();
+    expect(reaped).toEqual([]);
+  });
+
+  it("finishes the cleanup when the index no longer has the item", async () => {
+    const indexer = new FixtureIndexer({
+      kind: "rejected",
+      reason: "not_found",
+      message: "item_not_found",
+    });
+    const { sourceId, row, deps, reaped } = tombstoned({ indexer });
+    await env.KNOWLEDGE.put(row.r2Key, "Refunds take five days.");
+
+    const done = await ingestOne(remove(tenantId, sourceId), deps);
+
+    // An item the index has already lost is the state the delete wanted.
+    expect(done).toBe(true);
+    expect(await env.KNOWLEDGE.get(row.r2Key)).toBeNull();
+    expect(reaped).toEqual([sourceId]);
+  });
+
+  it("cleans up a row that was never indexed", async () => {
+    const { sourceId, row, deps, indexer, reaped } = harness({
+      row: { status: "deleting", aiSearchItemId: null },
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "Never made it to the index.");
+
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(true);
+    expect(indexer.removed).toEqual([]);
+    expect(reaped).toEqual([sourceId]);
+  });
+
+  it("refuses to destroy a row that is not marked deleting", async () => {
+    const { sourceId, row, deps, indexer, reaped } = harness({
+      row: { status: "ready", aiSearchItemId: "item-1" },
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "Still a live source.");
+
+    // Acked rather than retried: no number of redeliveries makes this message
+    // legitimate, and the tombstone is what authorises destruction.
+    expect(await ingestOne(remove(tenantId, sourceId), deps)).toBe(true);
+    expect(indexer.removed).toEqual([]);
+    expect(await env.KNOWLEDGE.get(row.r2Key)).not.toBeNull();
+    expect(reaped).toEqual([]);
+  });
+
+  it("acks a delete whose cleanup already finished", async () => {
+    const { deps, reaped } = tombstoned();
+
+    expect(await ingestOne(remove(tenantId, newSourceId()), deps)).toBe(true);
+    expect(reaped).toEqual([]);
+  });
+
+  it("does not index a source tombstoned while the upload was queued", async () => {
+    const { sourceId, row, deps, indexer, updates } = harness({
+      row: { status: "deleting" },
+    });
+    await env.KNOWLEDGE.put(row.r2Key, "Deleted before the consumer got to it.");
+
+    expect(await ingestOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(indexer.uploaded.size).toBe(0);
+    expect(updates).toEqual([]);
+  });
+
+  it("stops checking a source tombstoned while the check was waiting", async () => {
+    const { sourceId, deps, indexer, checks, updates } = tombstoned();
+
+    expect(await ingestOne(check(tenantId, sourceId, 2), deps)).toBe(true);
+    expect(indexer.checked).toEqual([]);
+    expect(checks).toEqual([]);
+    expect(updates).toEqual([]);
+  });
+});
+
+/**
+ * The dead letter queue's own consumer. Everything here has already spent its
+ * three attempts on the main queue, so nothing is retried: the only question is
+ * what the row should say once we have given up on it.
+ */
+describe("ingest dead letter", () => {
+  it("writes a terminal status on a row still waiting to be indexed", async () => {
+    const { sourceId, deps, updates } = harness({ row: { status: "uploaded" } });
+
+    const done = await deadLetterOne(message(tenantId, sourceId), deps);
+
+    expect(done).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "dlq" });
+  });
+
+  it("writes a terminal status on a row left indexing", async () => {
+    const { sourceId, deps, updates } = harness({
+      row: { status: "indexing", aiSearchItemId: "item-1" },
+    });
+
+    expect(await deadLetterOne(check(tenantId, sourceId, 3), deps)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ status: "error", errorCode: "dlq" });
+  });
+
+  it("leaves a row that settled on another delivery alone", async () => {
+    const { sourceId, deps, updates } = harness({ row: { status: "ready" } });
+
+    expect(await deadLetterOne(message(tenantId, sourceId), deps)).toBe(true);
+    expect(updates).toEqual([]);
+  });
+
+  it("does not resurrect a deleted source whose cleanup ran out of attempts", async () => {
+    const { sourceId, deps, updates } = harness({ row: { status: "deleting" } });
+
+    // Writing `error` here would put a file the user deleted back in the
+    // dashboard. The tombstone stays for the sweep instead.
+    expect(await deadLetterOne(remove(tenantId, sourceId), deps)).toBe(true);
+    expect(updates).toEqual([]);
+  });
+
+  it("acks a message whose row is already gone", async () => {
+    const { deps, updates } = harness();
+
+    expect(await deadLetterOne(message(tenantId, newSourceId()), deps)).toBe(true);
+    expect(updates).toEqual([]);
+  });
+
+  it("acks an unparseable message rather than dropping the batch", async () => {
+    const { deps, updates } = harness();
+
+    expect(await deadLetterOne({ nope: true }, deps)).toBe(true);
+    expect(updates).toEqual([]);
   });
 });

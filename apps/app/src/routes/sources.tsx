@@ -6,7 +6,9 @@ export const Route = createFileRoute("/sources")({ component: Sources });
 
 /** Poll while anything is still moving. Indexing normally settles in seconds. */
 const POLL_MS = 2_000;
-const IN_FLIGHT = new Set(["uploaded", "indexing"]);
+// `deleting` is in flight too: the row is a tombstone the consumer is cleaning
+// up behind, and it disappears from the list when the cleanup reaps it.
+const IN_FLIGHT = new Set(["uploaded", "indexing", "deleting"]);
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -24,6 +26,8 @@ function statusLabel(source: SourceSummary): string {
       return source.chunkCount === null ? "Ready" : `Ready, ${source.chunkCount} chunks`;
     case "error":
       return source.errorMessage ?? "Failed";
+    case "deleting":
+      return "Removing...";
     default: {
       // Exhaustiveness: a new status must be handled here rather than rendered raw.
       const never: never = source.status;
@@ -124,14 +128,22 @@ function Sources() {
       ) : (
         <ul className="tenants">
           {sources.map((source) => (
-            <li key={source.id}>
+            // A tombstoned row stays visible, greyed, until the cleanup reaps
+            // it. The delete already happened, so the button has nothing left
+            // to do and says so rather than offering a second 204.
+            <li key={source.id} className={source.status === "deleting" ? "pending" : undefined}>
               <span>
                 {source.filename}{" "}
                 <span className="role">
                   {formatSize(source.sizeBytes)} &middot; {statusLabel(source)}
                 </span>
               </span>
-              <button type="button" className="secondary" onClick={() => void onDelete(source.id)}>
+              <button
+                type="button"
+                className="secondary"
+                disabled={source.status === "deleting"}
+                onClick={() => void onDelete(source.id)}
+              >
                 Delete
               </button>
             </li>
