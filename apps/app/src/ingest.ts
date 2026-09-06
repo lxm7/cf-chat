@@ -491,7 +491,7 @@ async function rearm(
 }
 
 /** The production wiring: real bindings, real database, real index. */
-function liveDeps(): IngestDeps {
+export function liveIngestDeps(): IngestDeps {
   return {
     indexer: new AISearchIndexer(env.AI_SEARCH),
     storage: env.KNOWLEDGE,
@@ -567,35 +567,6 @@ export async function deadLetterOne(raw: unknown, deps: IngestDeps): Promise<boo
     errorMessage: lastError ? `${giveUp} Last error: ${lastError}` : giveUp,
   });
   return true;
-}
-
-/** Must match the queue names in `wrangler.jsonc`. */
-const INGEST_QUEUE = "cf-chat-ingest";
-const INGEST_DLQ = "cf-chat-ingest-dlq";
-
-/**
- * The queue consumer, attached to the default export in `src/server.ts` per
- * ADR-010. One Worker consumes both the `ingest` queue and its dead letter
- * queue, so the batch's own queue name is what separates them.
- */
-export async function handleIngestBatch(batch: MessageBatch<unknown>): Promise<void> {
-  // Deliberately not a defaulted second parameter: the runtime calls
-  // queue(batch, env, ctx), so a defaulted `deps` would be silently replaced by
-  // the env object at runtime while still typechecking.
-  const deps = liveDeps();
-
-  switch (batch.queue) {
-    case INGEST_DLQ:
-      return settleBatch(batch, (raw) => deadLetterOne(raw, deps));
-    case INGEST_QUEUE:
-      return ingestBatch(batch, deps);
-    default:
-      // Acked rather than thrown: a throw retries a batch that nobody is going
-      // to handle any better on the second attempt.
-      console.error("Batch from an unknown queue", batch.queue);
-      batch.ackAll();
-      return;
-  }
 }
 
 export async function ingestBatch(batch: MessageBatch<unknown>, deps: IngestDeps): Promise<void> {

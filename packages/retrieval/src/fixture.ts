@@ -5,9 +5,12 @@ import {
   type IndexError,
   type IndexedItem,
   type Indexer,
+  latestUserMessage,
   type RetrievalError,
+  type RetrievalMessage,
   type RetrievedChunk,
   type Retriever,
+  type ScoreKind,
   type SearchOptions,
 } from "./types.ts";
 
@@ -20,32 +23,48 @@ import {
  * the escalation threshold in ADR-006 without pretending to be a reranker.
  */
 export class FixtureRetriever implements Retriever {
+  /** Every message window this was searched with, in order, for assertions. */
+  readonly queries: RetrievalMessage[][] = [];
   readonly #chunksByTenant: Map<string, readonly RetrievedChunk[]>;
   readonly #failure: RetrievalError | null;
+  readonly #scoreKind: ScoreKind;
 
   constructor(
     chunksByTenant: Record<string, readonly RetrievedChunk[]> = {},
     failure: RetrievalError | null = null,
+    scoreKind: ScoreKind = "reranker",
   ) {
     this.#chunksByTenant = new Map(Object.entries(chunksByTenant));
     this.#failure = failure;
+    this.#scoreKind = scoreKind;
   }
 
   async search(
     tenantId: TenantId,
-    query: string,
+    messages: readonly RetrievalMessage[],
     options?: SearchOptions,
   ): Promise<Result<RetrievedChunk[], RetrievalError>> {
     if (this.#failure) {
       return err(this.#failure);
     }
 
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    // Scores against the last user turn only. The real implementation hands the
+    // whole window to AI Search and lets its query rewrite resolve follow-ups;
+    // faking that here would be inventing behaviour rather than standing in for
+    // it, so a test that cares about follow-ups asserts on what was passed.
+    this.queries.push([...messages]);
+    const terms = latestUserMessage(messages).toLowerCase().split(/\s+/).filter(Boolean);
     const scored = (this.#chunksByTenant.get(tenantId) ?? [])
       .map((chunk) => {
         const content = chunk.content.toLowerCase();
         const hits = terms.filter((term) => content.includes(term)).length;
-        return { ...chunk, score: terms.length === 0 ? 0 : hits / terms.length };
+        return {
+          ...chunk,
+          score: terms.length === 0 ? 0 : hits / terms.length,
+          // Standing in for a working reranker. A test that wants the
+          // misconfigured case constructs a `fused` chunk explicitly.
+          scoreKind: this.#scoreKind,
+        };
       })
       .filter((chunk) => chunk.score > 0)
       .sort((a, b) => b.score - a.score)

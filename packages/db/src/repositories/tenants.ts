@@ -1,4 +1,9 @@
-import type { TenantId, TenantPlan } from "@cf-chat/shared";
+import {
+  DEFAULT_ESCALATION_THRESHOLDS,
+  type EscalationThresholds,
+  type TenantId,
+  type TenantPlan,
+} from "@cf-chat/shared";
 import { eq } from "drizzle-orm";
 import type { Queryable } from "../client.ts";
 import { type TenantRow, tenants } from "../schema.ts";
@@ -33,4 +38,32 @@ export async function insertTenant(db: Queryable, input: InsertTenant): Promise<
     throw new Error("insertTenant returned no row");
   }
   return row;
+}
+
+/**
+ * The tenant's escalation thresholds, with the defaults filled in.
+ *
+ * Null columns mean "never tuned", so the default from `@cf-chat/shared`
+ * applies and stays changeable in one place rather than being copied into every
+ * tenant row at signup. Read once per conversation by the agent and cached in
+ * its state, not read per turn.
+ */
+export async function findEscalationThresholds(
+  db: Queryable,
+  tenantId: TenantId,
+): Promise<EscalationThresholds> {
+  const rows = await db
+    .select({
+      retrieval: tenants.retrievalThreshold,
+      confidence: tenants.confidenceThreshold,
+    })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+
+  const row = rows[0];
+  return {
+    retrieval: row?.retrieval ?? DEFAULT_ESCALATION_THRESHOLDS.retrieval,
+    confidence: row?.confidence ?? DEFAULT_ESCALATION_THRESHOLDS.confidence,
+  };
 }

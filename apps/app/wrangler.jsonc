@@ -12,10 +12,43 @@
   // socket and so needs node:net, node:tls and node:crypto.
   "compatibility_flags": ["nodejs_compat"],
 
+  // ADR-005: the model id is config, never a literal in the loop. The gateway
+  // id is here for the same reason, and because AI Gateway is where spend
+  // limits and per-tenant metadata live.
+  //
+  // Kimi K2.5 was deprecated on 30 May 2026 and Cloudflare aliases those
+  // requests to K2.6, so this names K2.6 directly rather than relying on an
+  // alias that will eventually be withdrawn. See the ADR-005 amendment.
+  "vars": {
+    "REPLY_MODEL_ID": "@cf/moonshotai/kimi-k2.6",
+    "AI_GATEWAY_ID": "default"
+  },
+
   "kv_namespaces": [
     {
       "binding": "KV",
       "id": "9f91441982644c9a95246cf76e6c7be9"
+    }
+  ],
+
+  // The reply loop. Private to `app`: the widget reaches it over a service
+  // binding rather than holding a cross-script stub (ADR-008).
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONVERSATION",
+        "class_name": "Conversation"
+      }
+    ]
+  },
+
+  // `new_sqlite_classes`, not `new_classes`: AIChatAgent stores messages and
+  // buffers stream chunks in SQLite, and the Agents SDK requires the SQLite
+  // backend. Getting this wrong fails at deploy, not at runtime.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Conversation"]
     }
   ],
 
@@ -51,6 +84,10 @@
       {
         "binding": "INGEST",
         "queue": "cf-chat-ingest"
+      },
+      {
+        "binding": "ANALYTICS",
+        "queue": "cf-chat-analytics"
       }
     ],
     "consumers": [
@@ -75,6 +112,25 @@
         // message that fails three status writes here is dropped, and the cron
         // sweep in build step 8 is what eventually notices the row.
         "max_retries": 3
+      },
+      {
+        // Turn records, written after the visitor already has their reply.
+        // Nothing is waiting on these, so the batch is large and the timeout
+        // long: one transaction per turn is the cost worth amortising.
+        "queue": "cf-chat-analytics",
+        "max_batch_size": 25,
+        "max_batch_timeout": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "cf-chat-analytics-dlq"
+      },
+      {
+        // Consumed only so a lost turn record says so in a log rather than
+        // vanishing. There is nothing to repair: unlike a source row, the
+        // analytics row *is* the record.
+        "queue": "cf-chat-analytics-dlq",
+        "max_batch_size": 25,
+        "max_batch_timeout": 30,
+        "max_retries": 1
       }
     ]
   },

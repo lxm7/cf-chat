@@ -2,8 +2,10 @@ import { newTenantId } from "@cf-chat/shared";
 import { describe, expect, it } from "vitest";
 import {
   AISearchIndexer,
+  AISearchRetriever,
   type AiSearchInstanceLike,
   type AiSearchNamespaceLike,
+  type AiSearchQueryNamespaceLike,
   instanceId,
 } from "../src/ai-search.ts";
 
@@ -435,5 +437,159 @@ describe("AISearchIndexer", () => {
     expect(result.ok).toBe(true);
     expect(fake.deleted).toEqual(["item-9"]);
     expect(fake.gotten).toEqual([instanceId(tenantId)]);
+  });
+});
+
+interface FakeSearchOptions {
+  readonly response?: unknown;
+  readonly throws?: Error;
+}
+
+function fakeSearchNamespace(options: FakeSearchOptions = {}) {
+  const calls: Array<{ instance: string; params: unknown }> = [];
+
+  const namespace: AiSearchQueryNamespaceLike = {
+    get: (name) => ({
+      search: async (params) => {
+        calls.push({ instance: name, params });
+        if (options.throws) throw options.throws;
+        return options.response ?? { chunks: [] };
+      },
+    }),
+  };
+
+  return { namespace, calls };
+}
+
+/** One chunk in the shape the binding actually returns. */
+function rawChunk(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "chunk-1",
+    text: "Refunds are issued within 14 days.",
+    score: 0.42,
+    item: { key: "src-uuid-billing-faq.md", metadata: { source_id: "src-uuid" } },
+    scoring_details: { reranking_score: 0.91 },
+    ...overrides,
+  };
+}
+
+describe("AISearchRetriever", () => {
+  const ask = [{ role: "user" as const, content: "how do refunds work" }];
+
+  it("thresholds on the reranker score, not the fused one", async () => {
+    const fake = fakeSearchNamespace({ response: { chunks: [rawChunk()] } });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value[0]?.score).toBe(0.91);
+    expect(result.value[0]?.scoreKind).toBe("reranker");
+  });
+
+  it("marks the score fused when reranking is off, rather than passing it off as a reranker score", async () => {
+    // The failure this guards against is silent: without `scoreKind`, signal 1
+    // would gate on a rank-derived number that means nothing across queries.
+    const fake = fakeSearchNamespace({
+      response: { chunks: [rawChunk({ scoring_details: undefined })] },
+    });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value[0]?.score).toBe(0.42);
+    expect(result.value[0]?.scoreKind).toBe("fused");
+  });
+
+  it("strips the source id prefix so a citation shows the filename", async () => {
+    const fake = fakeSearchNamespace({ response: { chunks: [rawChunk()] } });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value[0]?.source).toEqual({
+      id: "src-uuid",
+      title: "billing-faq.md",
+      url: null,
+    });
+  });
+
+  it("falls back to the raw key when the item carries no source id", async () => {
+    const fake = fakeSearchNamespace({
+      response: { chunks: [rawChunk({ item: { key: "orphan.md" } })] },
+    });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok && result.value[0]?.source.title).toBe("orphan.md");
+  });
+
+  it("sends the whole window with hybrid retrieval, reranking and rewriting on", async () => {
+    const fake = fakeSearchNamespace();
+    const window = [
+      { role: "user" as const, content: "what plans are there" },
+      { role: "assistant" as const, content: "Free and pro." },
+      { role: "user" as const, content: "what about the pro plan?" },
+    ];
+
+    await new AISearchRetriever(fake.namespace).search(tenantId, window, { limit: 3 });
+
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.instance).toBe(instanceId(tenantId));
+    expect(fake.calls[0]?.params).toEqual({
+      messages: window,
+      ai_search_options: {
+        retrieval: { retrieval_type: "hybrid", max_num_results: 3 },
+        reranking: { enabled: true },
+        query_rewrite: { enabled: true },
+      },
+    });
+  });
+
+  it("does not spend a rewrite on an empty question", async () => {
+    const fake = fakeSearchNamespace();
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, [
+      { role: "user", content: "   " },
+    ]);
+
+    expect(result.ok && result.value).toEqual([]);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("reports a missing instance as configuration, not an outage", async () => {
+    // A tenant that has never uploaded anything has no instance. That is a
+    // thing the dashboard can tell them to fix, unlike an outage.
+    const missing = new Error("instance_not_found");
+    missing.name = "AiSearchNotFoundError";
+    const fake = fakeSearchNamespace({ throws: missing });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("not_configured");
+  });
+
+  it("reports an unexpected throw as unavailable so the loop escalates", async () => {
+    const fake = fakeSearchNamespace({ throws: new Error("connection reset") });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("unavailable");
+  });
+
+  it("rejects a response in an unrecognised shape rather than inventing chunks", async () => {
+    const fake = fakeSearchNamespace({ response: { results: [] } });
+
+    const result = await new AISearchRetriever(fake.namespace).search(tenantId, ask);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("unavailable");
   });
 });

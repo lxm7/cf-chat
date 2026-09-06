@@ -6,6 +6,18 @@ export interface ChunkSource {
   readonly url: string | null;
 }
 
+/**
+ * Which number `RetrievedChunk.score` actually holds.
+ *
+ * This distinction is load-bearing for ADR-006. AI Search returns two scores: a
+ * fused hybrid score, which is rank-derived and so not comparable across
+ * queries, and the reranker's cross-encoder score, which is. Signal 1 may only
+ * threshold the second. Recording which one arrived means a misconfigured
+ * instance (reranking off) degrades into "cannot gate on this" rather than
+ * silently gating on a meaningless number.
+ */
+export type ScoreKind = "reranker" | "fused";
+
 export interface RetrievedChunk {
   readonly id: string;
   /**
@@ -14,12 +26,24 @@ export interface RetrievedChunk {
    */
   readonly content: string;
   /**
-   * Reranker cross-encoder score. This is the one score worth thresholding on;
-   * the fused hybrid score is rank-derived and not comparable across queries
-   * (ADR-006).
+   * The reranker cross-encoder score where `scoreKind` is `reranker`, which is
+   * the one ADR-006 thresholds on. Read `scoreKind` before comparing it against
+   * anything.
    */
   readonly score: number;
+  readonly scoreKind: ScoreKind;
   readonly source: ChunkSource;
+}
+
+/**
+ * A turn of conversation as retrieval sees it.
+ *
+ * Declared here rather than imported from `reply-loop` so the dependency runs
+ * one way: `reply-loop` depends on `retrieval`, never the reverse.
+ */
+export interface RetrievalMessage {
+  readonly role: "user" | "assistant";
+  readonly content: string;
 }
 
 export interface SearchOptions {
@@ -35,16 +59,31 @@ export type RetrievalError =
  * The seam that keeps AI Search swappable for Vectorize (ADR-002). Returns a
  * Result rather than throwing: a retrieval failure has to degrade into an
  * escalation, not a 500.
+ *
+ * Takes the recent turns rather than one query string because a follow-up
+ * ("what about the pro plan?") retrieves nothing on its own. Callers with a
+ * standalone question, such as the help centre, pass a single-element array.
  */
 export interface Retriever {
   search(
     tenantId: TenantId,
-    query: string,
+    messages: readonly RetrievalMessage[],
     options?: SearchOptions,
   ): Promise<Result<RetrievedChunk[], RetrievalError>>;
 }
 
 export const DEFAULT_SEARCH_LIMIT = 8;
+
+/** The last thing the visitor said, which is what a query rewrite anchors on. */
+export function latestUserMessage(messages: readonly RetrievalMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user") {
+      return message.content;
+    }
+  }
+  return "";
+}
 
 export interface IndexableDocument {
   /**

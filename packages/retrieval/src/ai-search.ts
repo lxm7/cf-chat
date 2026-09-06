@@ -1,6 +1,19 @@
 import { err, ok, type Result, type TenantId } from "@cf-chat/shared";
 import { z } from "zod";
-import type { IndexableDocument, IndexError, IndexedItem, Indexer } from "./types.ts";
+import {
+  DEFAULT_SEARCH_LIMIT,
+  type IndexableDocument,
+  type IndexError,
+  type IndexedItem,
+  type Indexer,
+  latestUserMessage,
+  type RetrievalError,
+  type RetrievalMessage,
+  type RetrievedChunk,
+  type Retriever,
+  type ScoreKind,
+  type SearchOptions,
+} from "./types.ts";
 
 /**
  * Structural view of the `ai_search_namespaces` binding, covering only what we
@@ -42,6 +55,34 @@ export interface AiSearchNamespaceLike {
     reranking?: boolean;
   }): Promise<AiSearchInstanceLike>;
   get(name: string): AiSearchInstanceLike;
+}
+
+/**
+ * The read side of the binding, kept separate from `AiSearchInstanceLike`
+ * rather than added to it. The real `env.AI_SEARCH` satisfies both, but the two
+ * halves are used by different classes and faked independently in tests, so
+ * widening the write-side interface would force every existing indexer fake to
+ * grow a `search` it never calls.
+ */
+export interface AiSearchSearchable {
+  search(params: {
+    // Narrower than the binding accepts, deliberately: a parameter type wider
+    // than the real one would make the real binding fail to satisfy this.
+    messages: Array<{ role: "user" | "assistant"; content: string }>;
+    ai_search_options?: {
+      retrieval?: {
+        retrieval_type?: "vector" | "keyword" | "hybrid";
+        max_num_results?: number;
+        match_threshold?: number;
+      };
+      reranking?: { enabled?: boolean; model?: string };
+      query_rewrite?: { enabled?: boolean };
+    };
+  }): Promise<unknown>;
+}
+
+export interface AiSearchQueryNamespaceLike {
+  get(name: string): AiSearchSearchable;
 }
 
 /**
@@ -356,4 +397,170 @@ export class AISearchIndexer implements Indexer {
       return err(fromThrown(cause));
     }
   }
+}
+
+/**
+ * The search response, parsed at the boundary like every other binding reply.
+ *
+ * `scoring_details` is optional because it is the part that disappears when
+ * reranking is off, and that absence is exactly what `scoreKind` exists to
+ * record. Parsing it as required would turn a misconfigured instance into an
+ * "unrecognised shape" outage, which is both wrong and unactionable.
+ */
+const searchChunk = z.object({
+  id: z.string().min(1),
+  text: z.string(),
+  score: z.number(),
+  item: z.object({
+    key: z.string().min(1),
+    metadata: z.record(z.string(), z.unknown()).nullish(),
+  }),
+  scoring_details: z
+    .object({
+      reranking_score: z.number().nullish(),
+    })
+    .nullish(),
+});
+
+const searchResponse = z.object({
+  chunks: z.array(searchChunk),
+});
+
+type SearchChunk = z.infer<typeof searchChunk>;
+
+/**
+ * The readable name behind an item key.
+ *
+ * The ingest consumer names items `${sourceId}-${filename}` so that two sources
+ * may share a filename (see `itemName` in apps/app/src/ingest.ts). Stripping
+ * the prefix back off is what makes a citation say "billing-faq.md" rather than
+ * a uuid the visitor has never seen.
+ */
+function chunkTitle(key: string, sourceId: string | null): string {
+  if (sourceId && key.startsWith(`${sourceId}-`)) {
+    return key.slice(sourceId.length + 1);
+  }
+  return key;
+}
+
+/** Metadata comes back as unknown, so the one field we wrote is read carefully. */
+function metadataString(
+  metadata: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function toRetrievedChunk(chunk: SearchChunk): RetrievedChunk {
+  const reranked = chunk.scoring_details?.reranking_score;
+  // The fused score is only ever a fallback for reporting. ADR-006 forbids
+  // thresholding it, which is why the kind travels with the number rather than
+  // being inferred by whoever reads it.
+  const hasReranker = typeof reranked === "number";
+  const scoreKind: ScoreKind = hasReranker ? "reranker" : "fused";
+  const sourceId = metadataString(chunk.item.metadata, "source_id");
+
+  return {
+    id: chunk.id,
+    content: chunk.text,
+    score: hasReranker ? reranked : chunk.score,
+    scoreKind,
+    source: {
+      id: sourceId ?? chunk.item.key,
+      title: chunkTitle(chunk.item.key, sourceId),
+      // Uploaded files have no public URL. Website sources will, when step 3's
+      // URL ingestion path grows one.
+      url: null,
+    },
+  };
+}
+
+/**
+ * The read half of the retrieval seam (ADR-002), sibling to `AISearchIndexer`.
+ *
+ * Reads through `get` rather than create-or-get: an instance is created by the
+ * first ingest, and a search has no business provisioning one. Searching a
+ * tenant that has never uploaded anything is a legitimate question with the
+ * answer "nothing", which signal 1 turns into an escalation.
+ */
+export class AISearchRetriever implements Retriever {
+  readonly #namespace: AiSearchQueryNamespaceLike;
+  readonly #rerankingModel: string | undefined;
+
+  constructor(namespace: AiSearchQueryNamespaceLike, options?: { rerankingModel?: string }) {
+    this.#namespace = namespace;
+    this.#rerankingModel = options?.rerankingModel;
+  }
+
+  async search(
+    tenantId: TenantId,
+    messages: readonly RetrievalMessage[],
+    options?: SearchOptions,
+  ): Promise<Result<RetrievedChunk[], RetrievalError>> {
+    // An empty question retrieves nothing meaningful, and asking anyway spends a
+    // rewrite inference to find that out.
+    if (latestUserMessage(messages).trim().length === 0) {
+      return ok([]);
+    }
+
+    let raw: unknown;
+    try {
+      raw = await this.#namespace.get(instanceId(tenantId)).search({
+        // The whole recent window, not just the last turn: `query_rewrite` is
+        // what resolves "what about the pro plan?" into something retrievable,
+        // and it can only do that if it can see what came before.
+        messages: messages.map((message) => ({ role: message.role, content: message.content })),
+        ai_search_options: {
+          retrieval: {
+            retrieval_type: "hybrid",
+            max_num_results: options?.limit ?? DEFAULT_SEARCH_LIMIT,
+          },
+          // Enabled per request as well as at instance creation. Both default
+          // off, and the reranker score is the only number signal 1 may gate on.
+          reranking: {
+            enabled: true,
+            ...(this.#rerankingModel ? { model: this.#rerankingModel } : {}),
+          },
+          query_rewrite: { enabled: true },
+        },
+      });
+    } catch (cause) {
+      return err(fromThrownRetrieval(cause));
+    }
+
+    const parsed = searchResponse.safeParse(raw);
+    if (!parsed.success) {
+      return err({
+        kind: "unavailable",
+        message: "AI Search returned search results in an unrecognised shape",
+      });
+    }
+
+    return ok(parsed.data.chunks.map(toRetrievedChunk));
+  }
+}
+
+/**
+ * Retrieval has only two failure kinds, so the indexer's richer classification
+ * does not transfer. The one distinction worth making is "this tenant has no
+ * instance yet", which is a configuration state rather than an outage and which
+ * the caller reports differently.
+ */
+function fromThrownRetrieval(cause: unknown): RetrievalError {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const name = cause instanceof Error ? cause.name : "";
+  const normalised = message.toLowerCase();
+
+  if (
+    name === "AiSearchNotFoundError" ||
+    normalised.includes("instance_not_found") ||
+    normalised.includes("not found")
+  ) {
+    return {
+      kind: "not_configured",
+      message: "This workspace has no search index yet. Upload a knowledge source first.",
+    };
+  }
+  return { kind: "unavailable", message };
 }

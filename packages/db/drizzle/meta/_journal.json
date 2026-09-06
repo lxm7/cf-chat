@@ -36,6 +36,20 @@
       "when": 1788579341848,
       "tag": "0004_big_darkstar",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788677825321,
+      "tag": "0005_conversations",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788677826321,
+      "tag": "0006_conversations_rls",
+      "breakpoints": true
     }
   ]
 }

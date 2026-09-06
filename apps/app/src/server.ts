@@ -1,24 +1,48 @@
+import { env } from "cloudflare:workers";
 import handler, { createServerEntry } from "@tanstack/react-start/server-entry";
+import { routeAgentRequest } from "agents";
+import { isAllowedAgentRequest } from "./agent-auth.ts";
 import { api } from "./api/index.ts";
-import { handleIngestBatch } from "./ingest.ts";
+import { handleQueueBatch } from "./queues.ts";
+
+/**
+ * The `Conversation` Durable Object, re-exported so wrangler can find the class
+ * on the same module its `main` points at. The class itself lives in
+ * `conversation.ts`; ADR-010 is why it lives in `app` at all.
+ */
+export { Conversation } from "./conversation.ts";
 
 /**
  * The Worker entry.
  *
- * Everything under /api is the Hono app; everything else is TanStack Start's
- * SSR handler. The async plumbing hangs off the same default export: ADR-010
- * records why it lives here in `app` rather than in a separate Worker, and why
- * `wrangler.jsonc` must keep pointing `main` at this file.
+ * Everything under /agents is the Agents SDK router, everything under /api is
+ * the Hono app, and everything else is TanStack Start's SSR handler. The async
+ * plumbing hangs off the same default export: ADR-010 records why it lives here
+ * in `app` rather than in a separate Worker, and why `wrangler.jsonc` must keep
+ * pointing `main` at this file.
  *
  * The queue handler has to sit on the object wrangler actually consumes, so it
- * is attached to the entry rather than exported separately. Verify it survives
- * the build (`grep queue dist/server/index.js`) rather than assuming: the
+ * is attached to the entry rather than exported separately. Verify it and the
+ * Durable Object class both survive the build
+ * (`grep -o Conversation dist/server/index.js`) rather than assuming: the
  * original ADR-010 bug was exactly an entry that looked right and was never
  * loaded.
  */
 const entry = createServerEntry({
-  fetch(request) {
+  async fetch(request) {
     const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/agents/")) {
+      // The name carries the tenant and the Durable Object trusts it, so this
+      // check is the isolation boundary for the reply loop rather than a
+      // convenience. See `agent-auth.ts`.
+      if (!(await isAllowedAgentRequest(request))) {
+        return new Response("Not authorised for this conversation", { status: 403 });
+      }
+      const routed = await routeAgentRequest(request, env);
+      return routed ?? new Response("No such agent", { status: 404 });
+    }
+
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
       return api.fetch(request);
     }
@@ -28,5 +52,5 @@ const entry = createServerEntry({
 
 export default {
   fetch: (request: Request, ...rest: never[]) => entry.fetch(request, ...rest),
-  queue: handleIngestBatch,
+  queue: handleQueueBatch,
 };
