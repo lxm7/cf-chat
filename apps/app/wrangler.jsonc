@@ -16,11 +16,14 @@
   // id is here for the same reason, and because AI Gateway is where spend
   // limits and per-tenant metadata live.
   //
-  // Kimi K2.5 was deprecated on 30 May 2026 and Cloudflare aliases those
-  // requests to K2.6, so this names K2.6 directly rather than relying on an
-  // alias that will eventually be withdrawn. See the ADR-005 amendment.
+  // Kimi K2.5 was deprecated on 30 May 2026 and aliased to K2.6. Rather than
+  // follow that alias up to K2.6's price, the PoC runs on GLM-4.7-Flash: 16x
+  // cheaper on input and 10x on output, still function calling, which the
+  // report_confidence tool needs. Swapping this line is the whole change; the
+  // eval set in build step 10 is what should settle it properly.
+  // See the ADR-005 amendment.
   "vars": {
-    "REPLY_MODEL_ID": "@cf/moonshotai/kimi-k2.6",
+    "REPLY_MODEL_ID": "@cf/zai-org/glm-4.7-flash",
     "AI_GATEWAY_ID": "default"
   },
 

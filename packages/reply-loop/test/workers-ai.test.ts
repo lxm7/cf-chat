@@ -77,7 +77,7 @@ describe("WorkersAIGenerator", () => {
         ...text("t1", "Refunds ", "take ", "14 days."),
         toolCall(JSON.stringify({ confidence: 0.85, needs_human: false, reason: "In the FAQ" })),
       ]),
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/zai-org/glm-4.7-flash",
     );
 
     const result = await generator.stream(input);
@@ -95,7 +95,7 @@ describe("WorkersAIGenerator", () => {
   it("emits no self report when the model skipped the tool call, so signal 2 escalates", async () => {
     const generator = new WorkersAIGenerator(
       modelEmitting(text("t1", "Probably about two weeks.")),
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/zai-org/glm-4.7-flash",
     );
 
     const result = await generator.stream(input);
@@ -114,7 +114,7 @@ describe("WorkersAIGenerator", () => {
         ...text("t1", "Refunds take 14 days."),
         toolCall(JSON.stringify({ confidence: 7, needs_human: "maybe" })),
       ]),
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/zai-org/glm-4.7-flash",
     );
 
     const result = await generator.stream(input);
@@ -134,7 +134,7 @@ describe("WorkersAIGenerator", () => {
         ...text("t1", "Refunds "),
         { type: "error", error: new Error("upstream capacity exceeded") },
       ]),
-      "@cf/moonshotai/kimi-k2.6",
+      "@cf/zai-org/glm-4.7-flash",
     );
 
     const result = await generator.stream(input);
@@ -161,7 +161,7 @@ describe("WorkersAIGenerator", () => {
       },
     });
 
-    const result = await new WorkersAIGenerator(model, "@cf/moonshotai/kimi-k2.6", {
+    const result = await new WorkersAIGenerator(model, "@cf/zai-org/glm-4.7-flash", {
       tenantName: "Acme",
     }).stream(input);
     expect(result.ok).toBe(true);
@@ -174,7 +174,7 @@ describe("WorkersAIGenerator", () => {
   });
 
   it("carries the model id as data, per ADR-005", () => {
-    const generator = new WorkersAIGenerator(modelEmitting([]), "@cf/moonshotai/kimi-k2.6");
-    expect(generator.modelId).toBe("@cf/moonshotai/kimi-k2.6");
+    const generator = new WorkersAIGenerator(modelEmitting([]), "@cf/zai-org/glm-4.7-flash");
+    expect(generator.modelId).toBe("@cf/zai-org/glm-4.7-flash");
   });
 });

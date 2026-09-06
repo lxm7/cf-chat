@@ -22,7 +22,7 @@ function turn(overrides: Record<string, unknown> = {}) {
     escalated: false,
     signal: null,
     rule: null,
-    modelId: "@cf/moonshotai/kimi-k2.6",
+    modelId: "@cf/zai-org/glm-4.7-flash",
     ...overrides,
   };
 }

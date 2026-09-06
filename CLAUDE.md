@@ -10,11 +10,11 @@ Currently a PoC / portfolio piece, designed to become multi-tenant SaaS without 
 - `docs/product.md`: positioning, pricing, cost model. Not needed for coding.
 
 ## Stack (fixed by ADRs)
-- Runtime: Workers with static assets, not Pages. Three Workers: `app`, `widget`, `help`.
+- Runtime: Workers with static assets, not Pages. Two Workers in the PoC: `app` and `widget`. Help centre is a route on `app`, not its own Worker.
 - DB: Neon Postgres via Hyperdrive, Drizzle. Sole system of record. No D1 in PoC.
 - Retrieval: AI Search, one instance per tenant, behind `packages/retrieval` `Retriever` interface.
-- Reply loop: Agents SDK `AIChatAgent` (a Durable Object) in `packages/reply-loop`.
-- Model: `@cf/moonshotai/kimi-k2.5` on Workers AI through AI Gateway. Model id is config, never hardcoded.
+- Reply loop: Agents SDK `AIChatAgent` (a Durable Object) in `apps/app`; the turn itself is `runTurn` in `packages/reply-loop`, binding-free and fixture-tested (ADR-010).
+- Model: `@cf/zai-org/glm-4.7-flash` on Workers AI through AI Gateway. Model id is config, never hardcoded.
 - Async: Queues (`ingest`, `outbound`, `analytics`, DLQ), Workflows (`EscalateConversation`, `KnowledgeGapDigest`, `TenantOffboard`), Cron.
 - Observability: Workers native tracing exported over OTLP; custom span attributes for retrieval score and escalation decision.
 
