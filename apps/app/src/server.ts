@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import handler, { createServerEntry } from "@tanstack/react-start/server-entry";
 import { routeAgentRequest } from "agents";
-import { isAllowedAgentRequest } from "./agent-auth.ts";
+import { type AgentPrincipal, authoriseAgentRequest, VISITOR_ID_HEADER } from "./agent-auth.ts";
 import { api } from "./api/index.ts";
 import { handleQueueBatch } from "./queues.ts";
 
@@ -36,10 +36,11 @@ const entry = createServerEntry({
       // The name carries the tenant and the Durable Object trusts it, so this
       // check is the isolation boundary for the reply loop rather than a
       // convenience. See `agent-auth.ts`.
-      if (!(await isAllowedAgentRequest(request))) {
+      const principal = await authoriseAgentRequest(request);
+      if (!principal) {
         return new Response("Not authorised for this conversation", { status: 403 });
       }
-      const routed = await routeAgentRequest(request, env);
+      const routed = await routeAgentRequest(withVisitorId(request, principal), env);
       return routed ?? new Response("No such agent", { status: 404 });
     }
 
@@ -54,3 +55,24 @@ export default {
   fetch: (request: Request, ...rest: never[]) => entry.fetch(request, ...rest),
   queue: handleQueueBatch,
 };
+
+/**
+ * Stamp the verified visitor id onto the request the agent will see.
+ *
+ * `onChatMessage` receives only client-supplied data, so a visitor id read from
+ * the message body is worth exactly as much as the socket that sent it. The
+ * Durable Object reads this header in `onConnect` instead. Setting it on a fresh
+ * `Headers` overwrites any value a caller supplied, which is the point: the
+ * header is a statement by `app`, not a field a client can fill in.
+ *
+ * Staff connections carry no visitor, so the header is absent and the agent
+ * mints one for the conversation.
+ */
+function withVisitorId(request: Request, principal: AgentPrincipal): Request {
+  if (principal.kind !== "visitor") {
+    return request;
+  }
+  const headers = new Headers(request.headers);
+  headers.set(VISITOR_ID_HEADER, principal.visitorId);
+  return new Request(request, { headers });
+}

@@ -16,7 +16,10 @@ export default defineConfig({
         compatibilityFlags: ["nodejs_compat"],
         kvNamespaces: ["KV"],
         r2Buckets: ["KNOWLEDGE"],
-        bindings: { SESSION_SECRET: "test-secret-not-a-real-key" },
+        bindings: {
+          SESSION_SECRET: "test-secret-not-a-real-key",
+          WIDGET_TOKEN_SECRET: "test-widget-secret-not-a-real-key",
+        },
       },
     }),
   ],

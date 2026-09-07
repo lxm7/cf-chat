@@ -12,13 +12,17 @@ import {
   type ConversationId,
   DEFAULT_ESCALATION_THRESHOLDS,
   type EscalationThresholds,
+  newVisitorId,
   parseConversationAgentName,
   type TenantId,
-  unsafeVisitorId,
+  type VisitorId,
+  visitorIdSchema,
 } from "@cf-chat/shared";
 import { AIChatAgent } from "@cloudflare/ai-chat";
+import type { Connection, ConnectionContext } from "agents";
 import { createUIMessageStream, createUIMessageStreamResponse, type UIMessage } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
+import { VISITOR_ID_HEADER } from "./agent-auth.ts";
 import { withDb } from "./api/db.ts";
 
 /**
@@ -33,11 +37,11 @@ import { withDb } from "./api/db.ts";
 export interface ConversationState {
   readonly thresholds: EscalationThresholds | null;
   readonly tenantName: string | null;
-}
-
-/** Extra fields the widget sends alongside a message. */
-interface TurnBody {
-  readonly visitorId?: unknown;
+  /**
+   * Set once, on the first connection that carries one, and never from a
+   * message body. See `#rememberVisitor`.
+   */
+  readonly visitorId: VisitorId | null;
 }
 
 /**
@@ -54,12 +58,29 @@ interface TurnBody {
  * billed for exactly as long as it generates.
  */
 export class Conversation extends AIChatAgent<Cloudflare.Env, ConversationState> {
-  override initialState: ConversationState = { thresholds: null, tenantName: null };
+  override initialState: ConversationState = {
+    thresholds: null,
+    tenantName: null,
+    visitorId: null,
+  };
 
-  override async onChatMessage(
-    _onFinish: unknown,
-    options?: { readonly body?: unknown },
-  ): Promise<Response> {
+  /**
+   * The only trustworthy moment to learn who the visitor is.
+   *
+   * `onChatMessage` sees nothing but client-supplied data, so a visitor id taken
+   * from the message body is worth exactly as much as the socket that sent it,
+   * which is to say nothing once the socket is open. The upgrade request is
+   * different: `app` verified the visitor token and stamped the result onto it
+   * (ADR-016), overwriting anything the client tried to send under that name.
+   *
+   * Written to agent state rather than an instance field because the object
+   * hibernates between messages and would lose a field (ADR-014).
+   */
+  override async onConnect(_connection: Connection, ctx: ConnectionContext): Promise<void> {
+    this.#rememberVisitor(ctx.request.headers.get(VISITOR_ID_HEADER));
+  }
+
+  override async onChatMessage(_onFinish: unknown): Promise<Response> {
     // The tenant comes from the Durable Object's name, which was chosen by the
     // Worker that authenticated the request. Taking it from the message body
     // would mean taking it from the socket.
@@ -84,7 +105,7 @@ export class Conversation extends AIChatAgent<Cloudflare.Env, ConversationState>
     const thresholds = await this.#thresholds(tenantId);
     const generator = this.#generator();
     const retriever = new AISearchRetriever(env.AI_SEARCH);
-    const visitorId = readVisitorId(options?.body);
+    const visitorId = this.#visitorId();
 
     const stream = createUIMessageStream({
       execute: async ({ writer }) => {
@@ -178,6 +199,44 @@ export class Conversation extends AIChatAgent<Cloudflare.Env, ConversationState>
   }
 
   /**
+   * Persist the visitor id `app` verified, once.
+   *
+   * Ignored when absent, which is the staff path: a dashboard user opening a
+   * conversation carries a session, not a visitor token. Ignored again once set,
+   * because the token binds one visitor to one conversation, so a later
+   * connection claiming a different visitor is either a bug or an attempt.
+   */
+  #rememberVisitor(header: string | null): void {
+    if (!header || this.state?.visitorId) {
+      return;
+    }
+    const parsed = visitorIdSchema.safeParse(header);
+    if (parsed.success) {
+      this.setState({ ...this.state, visitorId: parsed.data });
+    }
+  }
+
+  /**
+   * The visitor this conversation belongs to.
+   *
+   * Falls back to a minted id that is then persisted, so a staff-opened
+   * conversation still satisfies the not-null column on `conversations` and,
+   * more importantly, reports the same visitor on every turn. The previous
+   * implementation minted a fresh uuid per turn whenever the body carried
+   * nothing usable, which attributed the turns of one conversation to several
+   * different visitors in `question_log`.
+   */
+  #visitorId(): VisitorId {
+    const known = this.state?.visitorId;
+    if (known) {
+      return known;
+    }
+    const minted = newVisitorId();
+    this.setState({ ...this.state, visitorId: minted });
+    return minted;
+  }
+
+  /**
    * Model id and gateway are config, never literals (ADR-005). Both are vars in
    * `wrangler.jsonc`, so a missing one is a deploy-time mistake rather than a
    * silent fallback to something nobody chose.
@@ -196,7 +255,7 @@ export class Conversation extends AIChatAgent<Cloudflare.Env, ConversationState>
   async #record(
     tenantId: TenantId,
     conversationId: ConversationId,
-    visitorId: string,
+    visitorId: VisitorId,
     summary: TurnSummary,
   ): Promise<void> {
     try {
@@ -283,19 +342,4 @@ export function toGeneratorMessages(uiMessages: readonly UIMessage[]): Generator
     }
   }
   return messages;
-}
-
-/**
- * The visitor id the widget minted. Validated rather than trusted, and replaced
- * with a fresh one when it is missing or malformed: an unattributable
- * conversation is better than one attributed to a value the client made up.
- */
-function readVisitorId(body: unknown): string {
-  if (typeof body === "object" && body !== null) {
-    const candidate = (body as TurnBody).visitorId;
-    if (typeof candidate === "string" && /^[0-9a-f-]{36}$/i.test(candidate)) {
-      return unsafeVisitorId(candidate);
-    }
-  }
-  return crypto.randomUUID();
 }
