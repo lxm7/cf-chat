@@ -2,7 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2023"],
-    "types": []
+    // `worker-configuration.d.ts` supplies the runtime types, so
+    // @cloudflare/workers-types is deliberately absent. `node` is here because
+    // `@cf-chat/shared` is consumed as source and its `password.ts` imports
+    // node:crypto, which this Worker never calls but does typecheck.
+    "types": ["node", "@cloudflare/vitest-pool-workers/types"]
   },
-  "include": ["src", "worker-configuration.d.ts"]
+  "include": ["src", "test", "worker-configuration.d.ts"]
 }

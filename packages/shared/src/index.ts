@@ -8,3 +8,4 @@ export * from "./schemas.ts";
 export * from "./session.ts";
 export * from "./sources.ts";
 export * from "./visitor.ts";
+export * from "./widget.ts";

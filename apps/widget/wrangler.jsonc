@@ -5,6 +5,17 @@
   "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
 
+  // Shared with `app`: one namespace holds sessions, widget config and plan
+  // limits. Read only from this Worker, and never read-after-write (CLAUDE.md),
+  // so an origin added in the dashboard takes effect eventually rather than at
+  // once.
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "9f91441982644c9a95246cf76e6c7be9"
+    }
+  ],
+
   // ADR-008: the widget reaches the Conversation agent through a service
   // binding to `app`, not a cross-script Durable Object binding. The DO
   // namespace stays private to `app`.

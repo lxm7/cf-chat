@@ -115,6 +115,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/shared
     devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: 0.22.0
+        version: 0.22.0(@cloudflare/workers-types@5.20260903.1)(@vitest/runner@4.1.11)(@vitest/snapshot@4.1.11)(vitest@4.1.11(@types/node@26.4.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)(yaml@2.9.0))
+      vitest:
+        specifier: 4.1.11
+        version: 4.1.11(@types/node@26.4.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)(yaml@2.9.0)
       wrangler:
         specifier: 4.128.0
         version: 4.128.0(@cloudflare/workers-types@5.20260903.1)
